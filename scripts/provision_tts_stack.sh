@@ -154,6 +154,7 @@ import os
 import glob
 import tempfile
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import gradio as gr
 import numpy as np
@@ -165,6 +166,9 @@ os.environ.setdefault("COQUI_TOS_AGREED", "1")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PIPER_VOICES_DIR = os.path.join(APP_DIR, "piper_voices")
+
+# Workers for parallel chunk synthesis on CPU engines (one per CPU core).
+CPU_WORKERS = max(1, os.cpu_count() or 1)
 
 
 # ---------------------------------------------------------------------------
@@ -357,19 +361,46 @@ def _piper_load(model_path: str):
     return _piper_cache[model_path]
 
 
+def _piper_render_chunk(pv, chunk):
+    """Synthesize one chunk to a float32 mono array.
+
+    Safe to call from worker threads: Piper's underlying ONNX Runtime session
+    is thread-safe, so a single loaded voice can serve all workers.
+    """
+    parts = []
+    for audio_chunk in pv.synthesize(chunk):
+        arr = np.frombuffer(audio_chunk.audio_int16_bytes, dtype=np.int16)
+        parts.append(arr.astype(np.float32) / 32768.0)
+    if not parts:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(parts)
+
+
 def synth_piper(text, voice, lang_label, speaker_wav, progress):
     files = _piper_voice_files()
     if voice not in files:
         raise gr.Error("No Piper voice installed. Re-run the provisioning script.")
     pv = _piper_load(files[voice])
     chunks = chunk_text(text)
-    parts = []
     rate = pv.config.sample_rate
-    for i, chunk in enumerate(chunks):
-        progress((i + 1) / len(chunks), desc=f"[Piper] chunk {i + 1}/{len(chunks)}")
-        for audio_chunk in pv.synthesize(chunk):
-            arr = np.frombuffer(audio_chunk.audio_int16_bytes, dtype=np.int16)
-            parts.append(arr.astype(np.float32) / 32768.0)
+
+    # Piper runs on the CPU (ONNX Runtime), so we render chunks concurrently
+    # across all CPU cores and reassemble them in original order. This is where
+    # extra cores pay off; the GPU engines stay sequential since they serialise
+    # on the single GPU anyway.
+    results = [None] * len(chunks)
+    done = 0
+    with ThreadPoolExecutor(max_workers=CPU_WORKERS) as pool:
+        futures = {pool.submit(_piper_render_chunk, pv, c): i
+                   for i, c in enumerate(chunks)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            results[idx] = fut.result()
+            done += 1
+            progress(done / len(chunks),
+                     desc=f"[Piper] chunk {done}/{len(chunks)} (x{CPU_WORKERS} CPU)")
+
+    parts = [r for r in results if r is not None and len(r) > 0]
     if not parts:
         raise RuntimeError("Piper produced no audio.")
     return _write_wav(np.concatenate(parts), rate)
