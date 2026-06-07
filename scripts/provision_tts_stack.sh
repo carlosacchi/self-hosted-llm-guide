@@ -281,7 +281,34 @@ XTTS_LANGS = {
 }
 
 # Built-in XTTS speakers (used when no cloning sample is provided).
-XTTS_VOICES = ["Claribel Dervla", "Daisy Studious", "Andrew Chipper", "Damien Black"]
+# Each entry is (label shown in the dropdown, real speaker name used internally).
+# Character descriptions are indicative — the best way to choose is to listen.
+# Every speaker is multilingual: the timbre stays, the accent adapts per language.
+XTTS_VOICES = [
+    # --- Female ---
+    ("Claribel Dervla — F · clear, neutral",      "Claribel Dervla"),
+    ("Daisy Studious — F · calm, serious",        "Daisy Studious"),
+    ("Gracie Wise — F · warm, mature",            "Gracie Wise"),
+    ("Alison Dietlinde — F · soft, gentle",       "Alison Dietlinde"),
+    ("Ana Florence — F · bright, youthful",       "Ana Florence"),
+    ("Tammie Ema — F · energetic, lively",        "Tammie Ema"),
+    ("Sofia Hellen — F · smooth, expressive",     "Sofia Hellen"),
+    ("Tanja Adelina — F · deep, confident",       "Tanja Adelina"),
+    ("Brenda Stern — F · firm, narrator",         "Brenda Stern"),
+    ("Alexandra Hisakawa — F · light, airy",      "Alexandra Hisakawa"),
+    ("Nova Hogarth — F · crisp, modern",          "Nova Hogarth"),
+    # --- Male ---
+    ("Andrew Chipper — M · bright, lively",        "Andrew Chipper"),
+    ("Damien Black — M · deep, dark",              "Damien Black"),
+    ("Craig Gutsy — M · bold, gravelly",           "Craig Gutsy"),
+    ("Viktor Eka — M · calm, even",                "Viktor Eka"),
+    ("Royston Min — M · warm, rounded",            "Royston Min"),
+    ("Aaron Dreschner — M · neutral narrator",     "Aaron Dreschner"),
+    ("Baldur Sanjin — M · strong, resonant",       "Baldur Sanjin"),
+    ("Luis Moray — M · smooth, mid tone",          "Luis Moray"),
+    ("Dionisio Schuyler — M · mature, steady",     "Dionisio Schuyler"),
+    ("Marcos Rudaski — M · casual, friendly",      "Marcos Rudaski"),
+]
 
 _xtts_cache: dict = {}
 
@@ -493,8 +520,12 @@ def estimate(file_obj, engine_name):
 
 def on_engine_change(engine_name):
     cfg = ENGINES[engine_name]
+    choices = cfg["voices"]
+    # Choices may be plain strings or (label, value) tuples; pick the value.
+    first = choices[0]
+    default = first[1] if isinstance(first, tuple) else first
     return (
-        gr.update(choices=cfg["voices"], value=cfg["voices"][0]),
+        gr.update(choices=choices, value=default),
         gr.update(visible=cfg["cloning"]),
     )
 
