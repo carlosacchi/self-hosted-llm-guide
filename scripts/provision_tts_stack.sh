@@ -359,6 +359,37 @@ def _xtts_conditioning(model, voice, speaker_wav):
     return data["gpt_cond_latent"], data["speaker_embedding"]
 
 
+def _xtts_chunks(text, max_chars=240):
+    """Split text into sentence-aware chunks small enough for XTTS.
+
+    The low-level xtts.inference() does NOT auto-split text and hard-caps each
+    call at 400 tokens. The high-level tts() used to split sentences for us; now
+    that we call inference() directly (to cache speaker latents), we must split
+    here. We break on sentence punctuation and keep chunks well under the limit.
+    """
+    import re
+    # Split into sentences, keeping the terminating punctuation.
+    sentences = re.split(r"(?<=[.!?;:])\s+", text.replace("\n", " "))
+    chunks, current = [], ""
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        # A single overlong sentence is hard-split by characters as a fallback.
+        while len(sent) > max_chars:
+            chunks.append(sent[:max_chars])
+            sent = sent[max_chars:]
+        if len(current) + len(sent) + 1 <= max_chars:
+            current = (current + " " + sent).strip()
+        else:
+            if current:
+                chunks.append(current)
+            current = sent
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def synth_xtts(text, voice, lang_label, speaker_wav, params, progress):
     lang = XTTS_LANGS.get(lang_label, "en")
     model = _xtts_model()
@@ -377,7 +408,13 @@ def synth_xtts(text, voice, lang_label, speaker_wav, params, progress):
     temperature = params.get("temperature", 0.65)
     repetition_penalty = params.get("repetition_penalty", 2.0)
 
-    chunks = chunk_text(text, max_chars=1000)  # XTTS prefers shorter chunks
+    # transformers requires strict floats here (an int like 2 raises ValueError).
+    speed = float(speed)
+    temperature = float(temperature)
+    repetition_penalty = float(repetition_penalty)
+
+    # XTTS inference() caps each call at 400 tokens, so use small sentence chunks.
+    chunks = _xtts_chunks(text)
     parts = []
     for i, chunk in enumerate(chunks):
         progress((i + 1) / len(chunks), desc=f"[XTTS] chunk {i + 1}/{len(chunks)}")
@@ -521,14 +558,23 @@ def _estimate_line(char_count: int, engine_name: str) -> str:
     return f"~{eta} with {engine_name}"
 
 
-def estimate(file_obj, engine_name):
-    """Runs on file upload / engine change: count chars and estimate time."""
-    if file_obj is None:
-        return "Upload a PDF or TXT to see size and time estimate."
+def _resolve_text(text_input, file_obj):
+    """Return the text to synthesize: typed text wins, else the uploaded file."""
+    if text_input and text_input.strip():
+        return text_input
+    if file_obj is not None:
+        return read_text_from_file(file_obj.name)
+    return ""
+
+
+def estimate(text_input, file_obj, engine_name):
+    """Runs on text/file change: count chars and estimate time."""
     try:
-        text = read_text_from_file(file_obj.name)
+        text = _resolve_text(text_input, file_obj)
     except Exception as exc:
         return f"Could not read file: {exc}"
+    if not text:
+        return "Type some text or upload a PDF/TXT to see size and time estimate."
     char_count = len(text)
     word_count = len(text.split())
     if char_count == 0:
@@ -559,16 +605,16 @@ def on_engine_change(engine_name):
     )
 
 
-def convert(file_obj, engine_name, voice, lang_label, speaker_audio,
+def convert(text_input, file_obj, engine_name, voice, lang_label, speaker_audio,
             speed, temperature, repetition_penalty, progress=gr.Progress()):
     try:
-        if file_obj is None:
-            raise gr.Error("Please upload a PDF or TXT file.")
+        text = _resolve_text(text_input, file_obj)
+        if not text or not text.strip():
+            raise gr.Error("Type some text or upload a PDF/TXT file.")
 
-        text = read_text_from_file(file_obj.name)
         char_count = len(text)
         if char_count == 0:
-            raise gr.Error("The uploaded file appears to be empty or unreadable.")
+            raise gr.Error("The input appears to be empty or unreadable.")
 
         cfg = ENGINES[engine_name]
         speaker_wav = speaker_audio if (cfg["cloning"] and speaker_audio) else None
@@ -598,7 +644,15 @@ def convert(file_obj, engine_name, voice, lang_label, speaker_audio,
 with gr.Blocks(title="AI Hub — TTS") as demo:
     gr.Markdown("## Text-to-Speech")
 
-    file_input = gr.File(label="Upload PDF or TXT", file_types=[".pdf", ".txt"])
+    text_input = gr.Textbox(
+        label="Text to speak",
+        placeholder="Type or paste text here for a quick synthesis…",
+        lines=4,
+    )
+    file_input = gr.File(
+        label="…or upload a PDF / TXT (used only when the text box is empty)",
+        file_types=[".pdf", ".txt"],
+    )
 
     with gr.Row():
         engine_dd = gr.Dropdown(
@@ -634,7 +688,7 @@ with gr.Blocks(title="AI Hub — TTS") as demo:
         )
     estimate_box = gr.Textbox(
         label="File size & time estimate",
-        value="Upload a PDF or TXT to see size and time estimate.",
+        value="Type some text or upload a PDF/TXT to see size and time estimate.",
         interactive=False,
         lines=5,
     )
@@ -649,21 +703,26 @@ with gr.Blocks(title="AI Hub — TTS") as demo:
         outputs=[voice_dd, speaker_audio],
     )
 
-    # Update the size/time estimate whenever the file or engine changes.
+    # Update the size/time estimate whenever the text, file or engine changes.
+    text_input.change(
+        fn=estimate,
+        inputs=[text_input, file_input, engine_dd],
+        outputs=estimate_box,
+    )
     file_input.change(
         fn=estimate,
-        inputs=[file_input, engine_dd],
+        inputs=[text_input, file_input, engine_dd],
         outputs=estimate_box,
     )
     engine_dd.change(
         fn=estimate,
-        inputs=[file_input, engine_dd],
+        inputs=[text_input, file_input, engine_dd],
         outputs=estimate_box,
     )
 
     convert_btn.click(
         fn=convert,
-        inputs=[file_input, engine_dd, voice_dd, lang_dd, speaker_audio,
+        inputs=[text_input, file_input, engine_dd, voice_dd, lang_dd, speaker_audio,
                 speed_slider, temperature_slider, repetition_slider],
         outputs=[audio_out, status_label],
     )

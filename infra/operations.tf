@@ -17,8 +17,8 @@ resource "aws_iam_role" "scheduler_autostop" {
 }
 
 resource "aws_iam_role_policy" "scheduler_autostop" {
-  name   = "llm-gpu-autostop"
-  role   = aws_iam_role.scheduler_autostop.id
+  name = "llm-gpu-autostop"
+  role = aws_iam_role.scheduler_autostop.id
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [

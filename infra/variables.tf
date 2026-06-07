@@ -21,6 +21,18 @@ variable "key_pair_name" {
   default     = "llm-keypair"
 }
 
+variable "ssh_private_key_path" {
+  description = "Path to the private key matching key_pair_name, used to copy and run the provisioning scripts. Defaults to ~/.ssh/<key_pair_name>.pem"
+  type        = string
+  default     = ""
+}
+
+variable "run_bootstrap" {
+  description = "When true, copy the provisioning scripts onto the VM and run them automatically after creation."
+  type        = bool
+  default     = true
+}
+
 variable "root_volume_size" {
   description = "Root EBS volume size in GiB"
   type        = number

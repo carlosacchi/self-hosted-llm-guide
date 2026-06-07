@@ -13,6 +13,16 @@ output "ssh_command" {
   value       = "ssh -i ~/.ssh/${var.key_pair_name}.pem ubuntu@${aws_eip.llm_gpu.public_ip}"
 }
 
+output "web_ui_url" {
+  description = "Open WebUI (LLM chat) URL"
+  value       = "http://${aws_eip.llm_gpu.public_ip}:3000"
+}
+
+output "tts_ui_url" {
+  description = "Gradio TTS UI URL"
+  value       = "http://${aws_eip.llm_gpu.public_ip}:7860"
+}
+
 output "vpc_id" {
   description = "ID of the provisioned VPC"
   value       = aws_vpc.llm.id
