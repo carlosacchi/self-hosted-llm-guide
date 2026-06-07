@@ -315,22 +315,43 @@ def _prepare_speaker_wav(path: str) -> str:
     return out_path
 
 
+def _xtts_conditioning(model, voice, speaker_wav):
+    """Compute (gpt_cond_latent, speaker_embedding) ONCE for the whole document.
+
+    The high-level model.tts() recomputes these latents on every call, which is
+    wasteful when synthesizing many chunks. We derive them a single time here:
+      - from the uploaded sample when voice cloning
+      - from the built-in speaker manager otherwise
+    """
+    xtts = model.synthesizer.tts_model
+    if speaker_wav:
+        return xtts.get_conditioning_latents(audio_path=[speaker_wav])
+    # Built-in speaker: latents are precomputed in the speaker manager.
+    data = xtts.speaker_manager.speakers[voice]
+    return data["gpt_cond_latent"], data["speaker_embedding"]
+
+
 def synth_xtts(text, voice, lang_label, speaker_wav, progress):
     lang = XTTS_LANGS.get(lang_label, "en")
     model = _xtts_model()
     if speaker_wav:
         speaker_wav = _prepare_speaker_wav(speaker_wav)
+    xtts = model.synthesizer.tts_model
+
+    # Compute speaker conditioning ONCE, then reuse it for every chunk.
+    gpt_cond_latent, speaker_embedding = _xtts_conditioning(model, voice, speaker_wav)
+
     chunks = chunk_text(text, max_chars=1000)  # XTTS prefers shorter chunks
     parts = []
     for i, chunk in enumerate(chunks):
         progress((i + 1) / len(chunks), desc=f"[XTTS] chunk {i + 1}/{len(chunks)}")
-        kwargs = dict(text=chunk, language=lang)
-        if speaker_wav:
-            kwargs["speaker_wav"] = speaker_wav   # voice cloning
-        else:
-            kwargs["speaker"] = voice             # built-in speaker
-        wav = model.tts(**kwargs)
-        parts.append(_to_numpy(wav))
+        out = xtts.inference(
+            text=chunk,
+            language=lang,
+            gpt_cond_latent=gpt_cond_latent,
+            speaker_embedding=speaker_embedding,
+        )
+        parts.append(_to_numpy(out["wav"]))
     if not parts:
         raise RuntimeError("XTTS produced no audio.")
     return _write_wav(np.concatenate(parts), 24000)
