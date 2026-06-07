@@ -47,6 +47,14 @@ resource "aws_security_group" "llm_gpu" {
     cidr_blocks = [local.ingress_ipv4_cidr]
   }
 
+  ingress {
+    description = "Gradio TTS UI"
+    from_port   = 7860
+    to_port     = 7860
+    protocol    = "tcp"
+    cidr_blocks = [local.ingress_ipv4_cidr]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
