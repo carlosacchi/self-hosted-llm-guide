@@ -247,7 +247,7 @@ def _kokoro_pipeline(lang_code: str):
     return _kokoro_cache[lang_code]
 
 
-def synth_kokoro(text, voice, lang_label, speaker_wav, progress):
+def synth_kokoro(text, voice, lang_label, speaker_wav, params, progress):
     lang_code = KOKORO_LANGS.get(lang_label, "a")
     if voice[0] != lang_code:
         raise gr.Error(
@@ -255,11 +255,12 @@ def synth_kokoro(text, voice, lang_label, speaker_wav, progress):
             f"Pick a voice starting with '{lang_code}'."
         )
     pipeline = _kokoro_pipeline(lang_code)
+    speed = params.get("speed", 1.0)
     chunks = chunk_text(text)
     parts = []
     for i, chunk in enumerate(chunks):
         progress((i + 1) / len(chunks), desc=f"[Kokoro] chunk {i + 1}/{len(chunks)}")
-        for _, _, audio in pipeline(chunk, voice=voice, speed=1.0):
+        for _, _, audio in pipeline(chunk, voice=voice, speed=speed):
             parts.append(_to_numpy(audio))
     if not parts:
         raise RuntimeError("Kokoro produced no audio.")
@@ -358,7 +359,7 @@ def _xtts_conditioning(model, voice, speaker_wav):
     return data["gpt_cond_latent"], data["speaker_embedding"]
 
 
-def synth_xtts(text, voice, lang_label, speaker_wav, progress):
+def synth_xtts(text, voice, lang_label, speaker_wav, params, progress):
     lang = XTTS_LANGS.get(lang_label, "en")
     model = _xtts_model()
     if speaker_wav:
@@ -367,6 +368,14 @@ def synth_xtts(text, voice, lang_label, speaker_wav, progress):
 
     # Compute speaker conditioning ONCE, then reuse it for every chunk.
     gpt_cond_latent, speaker_embedding = _xtts_conditioning(model, voice, speaker_wav)
+
+    # Voice controls (ElevenLabs-like):
+    #   speed              -> speaking rate
+    #   temperature        -> expressiveness / variation (higher = more varied)
+    #   repetition_penalty -> intonation stability (higher = steadier, less sing-song)
+    speed = params.get("speed", 1.0)
+    temperature = params.get("temperature", 0.65)
+    repetition_penalty = params.get("repetition_penalty", 2.0)
 
     chunks = chunk_text(text, max_chars=1000)  # XTTS prefers shorter chunks
     parts = []
@@ -377,6 +386,9 @@ def synth_xtts(text, voice, lang_label, speaker_wav, progress):
             language=lang,
             gpt_cond_latent=gpt_cond_latent,
             speaker_embedding=speaker_embedding,
+            speed=speed,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
         )
         parts.append(_to_numpy(out["wav"]))
     if not parts:
@@ -409,14 +421,30 @@ def _piper_load(model_path: str):
     return _piper_cache[model_path]
 
 
-def _piper_render_chunk(pv, chunk):
+def _piper_syn_config(speed):
+    """Build a Piper SynthesisConfig for the requested speed, if supported.
+
+    Piper uses 'length_scale' (higher = slower), so it is the inverse of speed.
+    Returns None on older piper-tts builds that lack SynthesisConfig.
+    """
+    try:
+        from piper import SynthesisConfig
+        length_scale = (1.0 / speed) if speed else 1.0
+        return SynthesisConfig(length_scale=length_scale)
+    except Exception:
+        return None
+
+
+def _piper_render_chunk(pv, chunk, syn_config):
     """Synthesize one chunk to a float32 mono array.
 
     Safe to call from worker threads: Piper's underlying ONNX Runtime session
     is thread-safe, so a single loaded voice can serve all workers.
     """
+    gen = pv.synthesize(chunk, syn_config=syn_config) if syn_config is not None \
+        else pv.synthesize(chunk)
     parts = []
-    for audio_chunk in pv.synthesize(chunk):
+    for audio_chunk in gen:
         arr = np.frombuffer(audio_chunk.audio_int16_bytes, dtype=np.int16)
         parts.append(arr.astype(np.float32) / 32768.0)
     if not parts:
@@ -424,11 +452,12 @@ def _piper_render_chunk(pv, chunk):
     return np.concatenate(parts)
 
 
-def synth_piper(text, voice, lang_label, speaker_wav, progress):
+def synth_piper(text, voice, lang_label, speaker_wav, params, progress):
     files = _piper_voice_files()
     if voice not in files:
         raise gr.Error("No Piper voice installed. Re-run the provisioning script.")
     pv = _piper_load(files[voice])
+    syn_config = _piper_syn_config(params.get("speed", 1.0))
     chunks = chunk_text(text)
     rate = pv.config.sample_rate
 
@@ -439,7 +468,7 @@ def synth_piper(text, voice, lang_label, speaker_wav, progress):
     results = [None] * len(chunks)
     done = 0
     with ThreadPoolExecutor(max_workers=CPU_WORKERS) as pool:
-        futures = {pool.submit(_piper_render_chunk, pv, c): i
+        futures = {pool.submit(_piper_render_chunk, pv, c, syn_config): i
                    for i, c in enumerate(chunks)}
         for fut in as_completed(futures):
             idx = futures[fut]
@@ -530,7 +559,8 @@ def on_engine_change(engine_name):
     )
 
 
-def convert(file_obj, engine_name, voice, lang_label, speaker_audio, progress=gr.Progress()):
+def convert(file_obj, engine_name, voice, lang_label, speaker_audio,
+            speed, temperature, repetition_penalty, progress=gr.Progress()):
     try:
         if file_obj is None:
             raise gr.Error("Please upload a PDF or TXT file.")
@@ -542,6 +572,11 @@ def convert(file_obj, engine_name, voice, lang_label, speaker_audio, progress=gr
 
         cfg = ENGINES[engine_name]
         speaker_wav = speaker_audio if (cfg["cloning"] and speaker_audio) else None
+        params = {
+            "speed": speed,
+            "temperature": temperature,
+            "repetition_penalty": repetition_penalty,
+        }
 
         eta = _format_duration(char_count / ENGINE_CPS.get(engine_name, 300.0))
         progress(
@@ -550,7 +585,7 @@ def convert(file_obj, engine_name, voice, lang_label, speaker_audio, progress=gr
         )
         import time as _time
         _t0 = _time.time()
-        out_path = cfg["fn"](text, voice, lang_label, speaker_wav, progress)
+        out_path = cfg["fn"](text, voice, lang_label, speaker_wav, params, progress)
         elapsed = _format_duration(_time.time() - _t0)
         return out_path, f"Done — {char_count:,} characters via {engine_name} in {elapsed}."
     except gr.Error:
@@ -584,6 +619,19 @@ with gr.Blocks(title="AI Hub — TTS") as demo:
         visible=False,
     )
 
+    with gr.Accordion("Voice controls", open=False):
+        speed_slider = gr.Slider(
+            minimum=0.5, maximum=2.0, value=1.0, step=0.05,
+            label="Speed (all engines) — <1 slower, >1 faster",
+        )
+        temperature_slider = gr.Slider(
+            minimum=0.1, maximum=1.0, value=0.65, step=0.05,
+            label="Expressiveness / variation (XTTS only) — higher = more varied",
+        )
+        repetition_slider = gr.Slider(
+            minimum=1.0, maximum=10.0, value=2.0, step=0.5,
+            label="Intonation stability (XTTS only) — higher = steadier",
+        )
     estimate_box = gr.Textbox(
         label="File size & time estimate",
         value="Upload a PDF or TXT to see size and time estimate.",
@@ -615,7 +663,8 @@ with gr.Blocks(title="AI Hub — TTS") as demo:
 
     convert_btn.click(
         fn=convert,
-        inputs=[file_input, engine_dd, voice_dd, lang_dd, speaker_audio],
+        inputs=[file_input, engine_dd, voice_dd, lang_dd, speaker_audio,
+                speed_slider, temperature_slider, repetition_slider],
         outputs=[audio_out, status_label],
     )
 
