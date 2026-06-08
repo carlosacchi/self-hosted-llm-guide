@@ -6,7 +6,7 @@ set -euo pipefail
 ########################################
 
 # Default models to download (comma-separated, override via first argument)
-DEFAULT_MODELS="${1:-llama3.2:3b,qwen3-coder-next:latest}"
+DEFAULT_MODELS="${1:-llama3.2:3b,gemma4:26b,qwen3.5:27b}"
 
 # Published ports
 OPENWEBUI_PORT="${OPENWEBUI_PORT:-3000}"
