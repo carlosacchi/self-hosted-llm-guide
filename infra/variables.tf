@@ -62,9 +62,9 @@ variable "public_subnet_cidr" {
 }
 
 variable "availability_zone" {
-  description = "Availability zone for the public subnet"
+  description = "Availability zone for the public subnet. Leave empty to auto-select the first AZ in the active region."
   type        = string
-  default     = "eu-central-1a"
+  default     = ""
 }
 
 variable "additional_tags" {
