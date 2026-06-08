@@ -1,6 +1,6 @@
 # Self-Hosted LLM Lab on AWS
 
-Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** (g5 family) across **4 supported AWS regions**. The full application stack — Ollama + Open WebUI (LLM chat) and a Gradio multi-engine TTS UI — deploys **automatically via cloud-init on first boot**. No SSH key, no manual steps.
+Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** (g5 family) across **4 supported AWS regions**. The full application stack — Ollama + Open WebUI (LLM chat), a Gradio multi-engine TTS UI, and the Microsoft VibeVoice Realtime TTS UI — deploys **automatically via cloud-init on first boot**. No SSH key, no manual steps.
 
 ---
 
@@ -12,6 +12,8 @@ Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** (g5 fam
 | LLM chat UI | [Open WebUI](https://github.com/open-webui/open-webui) (Docker) | 3000 |
 | TTS engines | Kokoro · XTTS-v2 · Piper (Python venv, GPU) | — |
 | TTS UI | [Gradio](https://www.gradio.app) multi-engine app | 7860 |
+| VibeVoice TTS | [Microsoft VibeVoice-Realtime-0.5B](https://github.com/microsoft/VibeVoice) (Python venv, GPU) | 7861 |
+| Monitoring | [Netdata](https://www.netdata.cloud) real-time dashboard (GPU, CPU, RAM, disk) | 19999 |
 
 ### TTS engines
 
@@ -20,6 +22,7 @@ Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** (g5 fam
 | **Kokoro** | 9 presets (EN US/UK, IT, FR, ES, PT, JA) | Optional | Fast, low-latency |
 | **XTTS-v2** | 21 presets + voice cloning from audio sample | Required for quality | Multilingual, expressive |
 | **Piper** | EN US + IT (more downloadable) | No (CPU) | Ultra-light, always available |
+| **VibeVoice** | Multi-speaker conversational synthesis (served on its own port 7861) | Required | Long-form, expressive, podcast-style |
 
 ---
 
@@ -34,7 +37,10 @@ Terraform under [`infra/`](infra/) provisions:
   - `22/tcp` — SSH (optional, only if `key_pair_name` is set)
   - `3000/tcp` — Open WebUI
   - `7860/tcp` — Gradio TTS UI
+  - `7861/tcp` — VibeVoice Realtime TTS UI
   - `8000/tcp` — FastAPI (reserved)
+  - `11434/tcp` — Ollama REST API
+  - `19999/tcp` — Netdata monitoring dashboard
 - **Ops guardrail**: EventBridge Scheduler stops the instance nightly at **01:00 Europe/Amsterdam** to reduce costs.
 
 ### "Autostop" is not "no-cost"
@@ -89,10 +95,12 @@ infra/
   outputs.tf        Instance ID, public IP, URLs, SSH command
 
 scripts/
-  user-data.sh            Cloud-init entry point (downloads scripts from S3)
-  bootstrap_all.sh        Orchestrator: runs LLM then TTS provisioner in order
-  provision_llm_stack.sh  Docker + NVIDIA toolkit + Ollama + Open WebUI
-  provision_tts_stack.sh  Python venv + Kokoro + XTTS-v2 + Piper + Gradio app
+  user-data.sh                  Cloud-init entry point (downloads scripts from S3)
+  bootstrap_all.sh              Orchestrator: runs monitoring, LLM, TTS, then VibeVoice provisioners in order
+  provision_monitoring_stack.sh Netdata agent + real-time GPU/CPU/RAM/disk dashboard (port 19999)
+  provision_llm_stack.sh        Docker + NVIDIA toolkit + Ollama + Open WebUI
+  provision_tts_stack.sh        Python venv + Kokoro + XTTS-v2 + Piper + Gradio app
+  provision_vibevoice_stack.sh  Python venv + VibeVoice-Realtime-0.5B + web UI (port 7861)
 
 .github/workflows/
   manage-llm-vm.yml       Manual workflow: apply / destroy
@@ -160,6 +168,10 @@ Once Terraform creates the instance, AWS runs `scripts/user-data.sh` as root via
 cloud-init (user-data.sh)
   └── downloads scripts from S3 via IAM instance role
   └── bootstrap_all.sh
+        ├── provision_monitoring_stack.sh
+        │     ├── installs Netdata (stable, no telemetry)
+        │     ├── binds dashboard to 0.0.0.0:19999
+        │     └── auto-collects GPU (nvidia-smi), CPU, RAM, disk, network
         ├── provision_llm_stack.sh
         │     ├── installs Docker + NVIDIA Container Toolkit
         │     ├── writes docker-compose.yml (Ollama + Open WebUI)
@@ -171,6 +183,12 @@ cloud-init (user-data.sh)
               ├── downloads Piper voice models (EN US + IT)
               ├── writes Gradio app (app.py) with 3 TTS engine tabs
               └── registers tts-app.service (systemd, auto-restart)
+        └── provision_vibevoice_stack.sh
+              ├── clones github.com/microsoft/VibeVoice
+              ├── creates Python venv (reuses GPU PyTorch from DLAMI)
+              ├── installs VibeVoice with the streamingtts extra
+              ├── pre-downloads microsoft/VibeVoice-Realtime-0.5B
+              └── registers vibevoice.service (systemd, port 7861)
 ```
 
 **Logs on the VM**: `/var/log/llm-lab-bootstrap.log`
@@ -183,11 +201,19 @@ Provisioning takes **15–25 minutes** on a `g5.xlarge` (large Python packages +
 
 | App | URL | Notes |
 |---|---|---|
+| Monitoring | `http://<EIP>:19999` | Netdata: real-time GPU, GPU memory, CPU, RAM, disk |
 | Open WebUI | `http://<EIP>:3000` | LLM chat, model management |
 | Gradio TTS UI | `http://<EIP>:7860` | 3-tab TTS: Kokoro / XTTS-v2 / Piper |
-| Ollama API | `http://localhost:11434` | Via SSH tunnel only (not exposed publicly) |
+| VibeVoice TTS UI | `http://<EIP>:7861` | Multi-speaker, long-form conversational synthesis |
+| Ollama API | `http://<EIP>:11434` | REST API, restricted to your IP — **no auth, anyone on that IP can use the GPU** |
 
-SSH tunnel for Ollama API:
+Query the Ollama API directly (from your allowed IP):
+```bash
+curl http://<EIP>:11434/api/tags
+curl http://<EIP>:11434/api/generate -d '{"model":"llama3","prompt":"Hello"}'
+```
+
+Prefer not to expose it? Keep the `11434` ingress rule out of the security group and use an SSH tunnel instead (requires `key_pair_name`):
 ```bash
 ssh -L 11434:localhost:11434 ubuntu@<EIP>
 curl http://localhost:11434/api/tags

@@ -55,6 +55,30 @@ resource "aws_security_group" "llm_gpu" {
     cidr_blocks = [local.ingress_ipv4_cidr]
   }
 
+  ingress {
+    description = "VibeVoice Realtime TTS UI"
+    from_port   = 7861
+    to_port     = 7861
+    protocol    = "tcp"
+    cidr_blocks = [local.ingress_ipv4_cidr]
+  }
+
+  ingress {
+    description = "Ollama API"
+    from_port   = 11434
+    to_port     = 11434
+    protocol    = "tcp"
+    cidr_blocks = [local.ingress_ipv4_cidr]
+  }
+
+  ingress {
+    description = "Netdata monitoring dashboard"
+    from_port   = 19999
+    to_port     = 19999
+    protocol    = "tcp"
+    cidr_blocks = [local.ingress_ipv4_cidr]
+  }
+
   egress {
     from_port        = 0
     to_port          = 0
