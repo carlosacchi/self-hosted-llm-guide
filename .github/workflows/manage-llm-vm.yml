@@ -52,6 +52,11 @@ jobs:
 
     env:
       AWS_REGION: ${{ inputs.aws_region || 'eu-central-1' }}
+      # Region where the Terraform *state* S3 bucket physically lives. This is
+      # independent of the deployment region (AWS_REGION) so you can deploy the
+      # VM into any region while the state bucket stays put. Override with the
+      # TF_STATE_REGION secret if your bucket is not in eu-central-1.
+      TF_STATE_REGION: ${{ secrets.TF_STATE_REGION || 'eu-central-1' }}
       TF_STATE_KEY: llm-gpu/terraform.tfstate
       TF_VAR_instance_type: ${{ inputs.instance_type }}
       TF_VAR_key_pair_name: ${{ inputs.key_pair_name }}
@@ -81,7 +86,7 @@ jobs:
           terraform init \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=${{ env.TF_STATE_KEY }}" \
-            -backend-config="region=${{ env.AWS_REGION }}"
+            -backend-config="region=${{ env.TF_STATE_REGION }}"
 
       - name: Terraform Plan
         if: ${{ inputs.action == 'apply' }}

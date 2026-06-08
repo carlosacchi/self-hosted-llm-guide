@@ -111,7 +111,7 @@ scripts/
 ## Prerequisites
 
 1. **AWS credentials** with permissions for EC2, VPC, IAM, S3, EventBridge Scheduler.
-2. **S3 bucket** for Terraform remote state (one per AWS account is enough; use region-specific keys).
+2. **S3 bucket** for Terraform remote state (one per AWS account is enough; use region-specific keys). The bucket lives in a single region regardless of where you deploy the VM — set `TF_STATE_REGION` if it is not in `eu-central-1`.
 3. **Your public IPv4 address** for the `ipv4_allowed` parameter.
 4. **EC2 key pair** *(optional)* — only needed for SSH access. Leave `key_pair_name` blank if you don't need it.
 
@@ -126,6 +126,7 @@ scripts/
 | `AWS_ACCESS_KEY_ID` | AWS access key |
 | `AWS_SECRET_ACCESS_KEY` | AWS secret key |
 | `TF_STATE_BUCKET` | S3 bucket name for Terraform state |
+| `TF_STATE_REGION` | *(optional)* Region of the state bucket — defaults to `eu-central-1`. Set this if your state bucket lives elsewhere. |
 
 ### 2. Run the workflow
 
