@@ -135,20 +135,16 @@ services:
     image: ollama/ollama:latest
     container_name: ollama
     restart: unless-stopped
+      gpus: all
     ports:
       - "${OLLAMA_PORT}:11434"
     volumes:
       - ollama:/root/.ollama
-    # If an NVIDIA GPU exists, Docker will use the runtime configured by nvidia-container-toolkit.
-    # These env vars expose the correct capabilities.
+      # Use Docker Compose's explicit GPU flag; the deploy/devices form is not
+      # applied consistently outside Swarm.
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: ["gpu"]
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
