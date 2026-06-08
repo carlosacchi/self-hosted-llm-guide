@@ -16,19 +16,13 @@ variable "instance_type" {
 }
 
 variable "key_pair_name" {
-  description = "Name of an existing EC2 key pair"
-  type        = string
-  default     = "llm-keypair"
-}
-
-variable "ssh_private_key_path" {
-  description = "Path to the private key matching key_pair_name, used to copy and run the provisioning scripts. Defaults to ~/.ssh/<key_pair_name>.pem"
+  description = "Optional name of an existing EC2 key pair for SSH access. Leave empty to deploy without a key pair (provisioning runs via cloud-init, no SSH needed)."
   type        = string
   default     = ""
 }
 
 variable "run_bootstrap" {
-  description = "When true, copy the provisioning scripts onto the VM and run them automatically after creation."
+  description = "When true, embed the provisioning scripts in cloud-init user-data and run them automatically on first boot."
   type        = bool
   default     = true
 }

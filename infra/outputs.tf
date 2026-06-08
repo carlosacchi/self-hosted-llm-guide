@@ -9,8 +9,8 @@ output "public_ip" {
 }
 
 output "ssh_command" {
-  description = "Helper command for SSH"
-  value       = "ssh -i ~/.ssh/${var.key_pair_name}.pem ubuntu@${aws_eip.llm_gpu.public_ip}"
+  description = "Helper command for SSH (only when a key pair was provided)"
+  value       = var.key_pair_name != "" ? "ssh -i ~/.ssh/${var.key_pair_name}.pem ubuntu@${aws_eip.llm_gpu.public_ip}" : "No key pair configured. Provisioning runs automatically via cloud-init; use EC2 Instance Connect or SSM Session Manager from the AWS console if you need shell access."
 }
 
 output "web_ui_url" {

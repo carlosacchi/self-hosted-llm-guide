@@ -71,10 +71,20 @@ resource "aws_security_group" "llm_gpu" {
 resource "aws_instance" "llm_gpu" {
   ami                         = data.aws_ami.dlami.id
   instance_type               = var.instance_type
-  key_name                    = var.key_pair_name
+  key_name                    = var.key_pair_name != "" ? var.key_pair_name : null
   subnet_id                   = aws_subnet.public.id
   vpc_security_group_ids      = [aws_security_group.llm_gpu.id]
   associate_public_ip_address = true
+  iam_instance_profile        = var.run_bootstrap ? aws_iam_instance_profile.llm_gpu[0].name : null
+
+  # Provisioning runs via cloud-init on first boot (no SSH / key pair needed).
+  # The instance downloads the provisioning scripts from a private S3 bucket
+  # using its IAM role, then runs them as root. This keeps user-data under the
+  # 16 KB EC2 limit. Logs land in /var/log/llm-lab-bootstrap.log on the VM.
+  user_data = var.run_bootstrap ? templatefile("${path.module}/../scripts/user-data.sh", {
+    scripts_bucket = aws_s3_bucket.scripts[0].bucket
+    aws_region     = var.aws_region
+  }) : null
 
   root_block_device {
     volume_size           = var.root_volume_size
@@ -90,6 +100,8 @@ resource "aws_instance" "llm_gpu" {
   tags = merge({
     Name = "llm-gpu-${var.instance_type}"
   }, local.lab_tags)
+
+  depends_on = [aws_s3_object.scripts]
 }
 
 resource "aws_eip" "llm_gpu" {
@@ -101,45 +113,4 @@ resource "aws_eip" "llm_gpu" {
   tags = merge({
     Name = "llm-gpu-eip"
   }, local.lab_tags)
-}
-
-# Copies the provisioning scripts onto the VM and runs them in order.
-# Re-runs automatically whenever any of the scripts change (filemd5 triggers),
-# so editing a script and re-applying re-provisions without recreating the VM.
-resource "null_resource" "bootstrap" {
-  count = var.run_bootstrap ? 1 : 0
-
-  triggers = {
-    instance_id  = aws_instance.llm_gpu.id
-    bootstrap_sh = filemd5("${path.module}/../scripts/bootstrap_all.sh")
-    llm_script   = filemd5("${path.module}/../scripts/provision_llm_stack.sh")
-    tts_script   = filemd5("${path.module}/../scripts/provision_tts_stack.sh")
-  }
-
-  connection {
-    type        = "ssh"
-    host        = aws_eip.llm_gpu.public_ip
-    user        = "ubuntu"
-    private_key = file(local.ssh_private_key_path)
-    timeout     = "10m"
-  }
-
-  # Ensure the destination directory exists before uploading.
-  provisioner "remote-exec" {
-    inline = ["mkdir -p /home/ubuntu/provisioning"]
-  }
-
-  # Upload the contents of scripts/ into /home/ubuntu/provisioning.
-  provisioner "file" {
-    source      = "${path.module}/../scripts/"
-    destination = "/home/ubuntu/provisioning"
-  }
-
-  # Make them executable and run the orchestrator.
-  provisioner "remote-exec" {
-    inline = [
-      "chmod +x /home/ubuntu/provisioning/*.sh",
-      "sudo bash /home/ubuntu/provisioning/bootstrap_all.sh",
-    ]
-  }
 }
