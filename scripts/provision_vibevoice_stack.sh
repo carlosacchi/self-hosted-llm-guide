@@ -70,6 +70,32 @@ clone_repo() {
 }
 
 ########################################
+# Step 2b: patch the demo for the DLAMI's PyTorch (>= 2.6)
+########################################
+
+patch_app() {
+  local app_py="${VV_DIR}/demo/web/app.py"
+
+  if [[ ! -f "${app_py}" ]]; then
+    log "WARNING: ${app_py} not found, skipping patch."
+    return
+  fi
+
+  # The voice preset .pt files contain a pickled BaseModelOutputWithPast object.
+  # PyTorch 2.6+ defaults torch.load to weights_only=True, and the DLAMI ships
+  # torch 2.12 whose stricter unpickler refuses to deserialize that object,
+  # crashing startup with an UnpicklingError. The presets are published by
+  # Microsoft in this same repo (trusted source), so loading them with
+  # weights_only=False is safe. This patch is idempotent.
+  if grep -q "weights_only=True" "${app_py}"; then
+    log "Patching ${app_py}: weights_only=True -> weights_only=False (PyTorch >= 2.6 preset load)..."
+    sed -i 's/weights_only=True/weights_only=False/g' "${app_py}"
+  else
+    log "No weights_only=True found in ${app_py} (already patched or upstream changed)."
+  fi
+}
+
+########################################
 # Step 3: Python virtual environment + package install
 ########################################
 
@@ -92,7 +118,13 @@ install_python_packages() {
   # Editable install of the cloned repo with the streaming-TTS extra. This
   # pulls the streaming model, processor, FastAPI demo deps, etc. The model
   # loader auto-falls back from flash_attention_2 to SDPA if flash-attn is
-  # not available, so we do not force a flash-attn build here.
+  # not available.
+  #
+  # NOTE: flash-attn is intentionally NOT installed here. The DLAMI ships a
+  # torch built against CUDA 13.0 while the system CUDA toolkit is 12.8, and
+  # no prebuilt flash-attn wheel exists for this torch/cuda/python combo, so a
+  # source build fails on the CUDA-version-mismatch check. VibeVoice runs with
+  # SDPA instead (slightly lower audio quality, but functional).
   "${VV_DIR}/.venv/bin/pip" install -e "${VV_DIR}[streamingtts]"
 
   log "VibeVoice packages installed."
@@ -153,6 +185,7 @@ main() {
   require_root
   install_system_deps
   clone_repo
+  patch_app
   create_venv
   install_python_packages
   download_model

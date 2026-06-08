@@ -64,6 +64,14 @@ resource "aws_security_group" "llm_gpu" {
   }
 
   ingress {
+    description = "VibeVoice multi-speaker TTS UI"
+    from_port   = 7862
+    to_port     = 7862
+    protocol    = "tcp"
+    cidr_blocks = [local.ingress_ipv4_cidr]
+  }
+
+  ingress {
     description = "Ollama API"
     from_port   = 11434
     to_port     = 11434

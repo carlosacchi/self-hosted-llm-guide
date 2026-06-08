@@ -1,6 +1,6 @@
 # Self-Hosted LLM Lab on AWS
 
-Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** (g5 family) across **4 supported AWS regions**. The full application stack — Ollama + Open WebUI (LLM chat), a Gradio multi-engine TTS UI, and the Microsoft VibeVoice Realtime TTS UI — deploys **automatically via cloud-init on first boot**. No SSH key, no manual steps.
+Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** (g5 family) across **4 supported AWS regions**. The full application stack — Ollama + Open WebUI (LLM chat), a Gradio multi-engine TTS UI, the Microsoft VibeVoice Realtime (single-speaker) TTS UI, and a VibeVoice-1.5B multi-speaker (podcast) UI — deploys **automatically via cloud-init on first boot**. No SSH key, no manual steps.
 
 ---
 
@@ -13,6 +13,7 @@ Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** (g5 fam
 | TTS engines | Kokoro · XTTS-v2 · Piper (Python venv, GPU) | — |
 | TTS UI | [Gradio](https://www.gradio.app) multi-engine app | 7860 |
 | VibeVoice TTS | [Microsoft VibeVoice-Realtime-0.5B](https://github.com/microsoft/VibeVoice) (Python venv, GPU) | 7861 |
+| VibeVoice multi-speaker | [VibeVoice-1.5B (community fork)](https://github.com/vibevoice-community/VibeVoice) (Python venv, GPU) | 7862 |
 | Monitoring | [Netdata](https://www.netdata.cloud) real-time dashboard (GPU, CPU, RAM, disk) | 19999 |
 
 ### TTS engines
@@ -22,7 +23,8 @@ Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** (g5 fam
 | **Kokoro** | 9 presets (EN US/UK, IT, FR, ES, PT, JA) | Optional | Fast, low-latency |
 | **XTTS-v2** | 21 presets + voice cloning from audio sample | Required for quality | Multilingual, expressive |
 | **Piper** | EN US + IT (more downloadable) | No (CPU) | Ultra-light, always available |
-| **VibeVoice** | Multi-speaker conversational synthesis (served on its own port 7861) | Required | Long-form, expressive, podcast-style |
+| **VibeVoice** | Single-speaker streaming synthesis (Realtime-0.5B, own port 7861) | Required | Low-latency, real-time, voice presets |
+| **VibeVoice multi-speaker** | Up to 4 speakers, podcast/turn-taking (1.5B, own port 7862) | Required | Long-form, expressive, podcast-style |
 
 ---
 
@@ -37,7 +39,8 @@ Terraform under [`infra/`](infra/) provisions:
   - `22/tcp` — SSH (optional, only if `key_pair_name` is set)
   - `3000/tcp` — Open WebUI
   - `7860/tcp` — Gradio TTS UI
-  - `7861/tcp` — VibeVoice Realtime TTS UI
+  - `7861/tcp` — VibeVoice Realtime TTS UI (single speaker)
+  - `7862/tcp` — VibeVoice multi-speaker TTS UI (podcast)
   - `8000/tcp` — FastAPI (reserved)
   - `11434/tcp` — Ollama REST API
   - `19999/tcp` — Netdata monitoring dashboard
@@ -101,6 +104,7 @@ scripts/
   provision_llm_stack.sh        Docker + NVIDIA toolkit + Ollama + Open WebUI
   provision_tts_stack.sh        Python venv + Kokoro + XTTS-v2 + Piper + Gradio app
   provision_vibevoice_stack.sh  Python venv + VibeVoice-Realtime-0.5B + web UI (port 7861)
+  provision_vibevoice_tts_stack.sh  Python venv + VibeVoice-1.5B (community fork) multi-speaker podcast UI (port 7862)
 
 .github/workflows/
   manage-llm-vm.yml       Manual workflow: apply / destroy
@@ -190,6 +194,13 @@ cloud-init (user-data.sh)
               ├── installs VibeVoice with the streamingtts extra
               ├── pre-downloads microsoft/VibeVoice-Realtime-0.5B
               └── registers vibevoice.service (systemd, port 7861)
+        └── provision_vibevoice_tts_stack.sh
+              ├── clones github.com/vibevoice-community/VibeVoice (official TTS code was removed by Microsoft)
+              ├── creates an isolated Python venv (reuses GPU PyTorch from DLAMI)
+              ├── installs the community VibeVoice package (editable)
+              ├── patches the Gradio demo to bind 0.0.0.0 on port 7862 (no public share tunnel)
+              ├── pre-downloads vibevoice/VibeVoice-1.5B (up to 4 speakers)
+              └── registers vibevoice-tts.service (systemd, port 7862)
 ```
 
 **Logs on the VM**: `/var/log/llm-lab-bootstrap.log`

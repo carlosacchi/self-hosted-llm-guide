@@ -24,8 +24,13 @@ output "tts_ui_url" {
 }
 
 output "vibevoice_ui_url" {
-  description = "VibeVoice Realtime TTS UI URL"
+  description = "VibeVoice Realtime (single-speaker) TTS UI URL"
   value       = "http://${aws_eip.llm_gpu.public_ip}:7861"
+}
+
+output "vibevoice_multispeaker_ui_url" {
+  description = "VibeVoice 1.5B multi-speaker (podcast) TTS UI URL"
+  value       = "http://${aws_eip.llm_gpu.public_ip}:7862"
 }
 
 output "monitoring_url" {
