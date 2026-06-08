@@ -57,7 +57,11 @@ jobs:
       # VM into any region while the state bucket stays put. Override with the
       # TF_STATE_REGION secret if your bucket is not in eu-central-1.
       TF_STATE_REGION: ${{ secrets.TF_STATE_REGION || 'eu-central-1' }}
-      TF_STATE_KEY: llm-gpu/terraform.tfstate
+      # State key is scoped per deploy region. Resources are region-specific, so
+      # each region keeps its own independent state file. This prevents cross-region
+      # contamination (e.g. a scripts bucket created in eu-central-1 being read with
+      # an eu-west-1 endpoint, which returns a 301 PermanentRedirect).
+      TF_STATE_KEY: llm-gpu/${{ inputs.aws_region || 'eu-central-1' }}/terraform.tfstate
       TF_VAR_instance_type: ${{ inputs.instance_type }}
       TF_VAR_key_pair_name: ${{ inputs.key_pair_name }}
       TF_VAR_root_volume_size: ${{ inputs.root_volume_size }}

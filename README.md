@@ -111,7 +111,7 @@ scripts/
 ## Prerequisites
 
 1. **AWS credentials** with permissions for EC2, VPC, IAM, S3, EventBridge Scheduler.
-2. **S3 bucket** for Terraform remote state (one per AWS account is enough; use region-specific keys). The bucket lives in a single region regardless of where you deploy the VM — set `TF_STATE_REGION` if it is not in `eu-central-1`.
+2. **S3 bucket** for Terraform remote state (one per AWS account is enough). State is keyed per deploy region (`llm-gpu/<region>/terraform.tfstate`) so each region is independent and never collides. The bucket itself lives in a single region regardless of where you deploy the VM — set `TF_STATE_REGION` if it is not in `eu-central-1`.
 3. **Your public IPv4 address** for the `ipv4_allowed` parameter.
 4. **EC2 key pair** *(optional)* — only needed for SSH access. Leave `key_pair_name` blank if you don't need it.
 
@@ -150,8 +150,8 @@ Terraform outputs (Elastic IP, app URLs, SSH command) are printed at the end of 
 ```bash
 terraform -chdir=infra init \
   -backend-config="bucket=<your-tfstate-bucket>" \
-  -backend-config="key=llm-gpu/terraform.tfstate" \
-  -backend-config="region=eu-west-1"
+  -backend-config="key=llm-gpu/eu-west-1/terraform.tfstate" \
+  -backend-config="region=eu-central-1"
 
 terraform -chdir=infra apply -auto-approve \
   -var='aws_region=eu-west-1' \
