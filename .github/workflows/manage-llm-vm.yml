@@ -1,5 +1,11 @@
 name: Manage GPU VM
 
+# Opt JavaScript actions into Node.js 24. The pinned actions (checkout@v4,
+# configure-aws-credentials@v4, setup-terraform@v3) still ship a Node 20
+# runtime; this silences the deprecation warning and is forward-compatible.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 on:
   workflow_dispatch:
     inputs:
