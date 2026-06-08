@@ -135,13 +135,13 @@ services:
     image: ollama/ollama:latest
     container_name: ollama
     restart: unless-stopped
-      gpus: all
+    # Use Docker Compose's explicit GPU flag; the deploy/devices form is not
+    # applied consistently outside Swarm.
+    gpus: all
     ports:
       - "${OLLAMA_PORT}:11434"
     volumes:
       - ollama:/root/.ollama
-      # Use Docker Compose's explicit GPU flag; the deploy/devices form is not
-      # applied consistently outside Swarm.
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
