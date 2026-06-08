@@ -24,13 +24,30 @@ set -euo pipefail
 # --system-site-packages. The demo auto-falls back from flash_attention_2 to
 # SDPA, so no flash-attn build is needed.
 #
+# Multiple instances:
+#   The app dir and the systemd unit are both derived from VVT_NAME, so this
+#   script can stand up several isolated instances side by side. For example,
+#   a 1.5B stack on 7862 (default) and a 7B stack on 7863:
+#
+#     sudo bash provision_vibevoice_tts_stack.sh                      # 1.5B / 7862
+#     sudo VVT_NAME=vibevoice-tts-7b VVT_PORT=7863 \
+#          VVT_MODEL=vibevoice/VibeVoice-7B \
+#          bash provision_vibevoice_tts_stack.sh                      # 7B   / 7863
+#
+#   NOTE: the 7B model needs ~16 GB VRAM. Running the 1.5B and 7B services
+#   concurrently on a single 24 GB GPU (e.g. g5.xlarge) is tight and may OOM
+#   during long generations; prefer a larger GPU or stop one service.
+#
 # Usage:
 #   sudo bash provision_vibevoice_tts_stack.sh [app-dir]
 #
 # Default app dir: /opt/vibevoice-tts
 ########################################
 
-VVT_DIR="${1:-/opt/vibevoice-tts}"
+# Instance name — drives both the app dir and the systemd unit so multiple
+# instances can coexist without colliding. Override via env for a 2nd instance.
+VVT_NAME="${VVT_NAME:-vibevoice-tts}"
+VVT_DIR="${1:-${VVT_DIR:-/opt/${VVT_NAME}}}"
 VVT_USER="${VVT_USER:-ubuntu}"
 VVT_GROUP="${VVT_GROUP:-ubuntu}"
 VVT_PORT="${VVT_PORT:-7862}"
@@ -163,11 +180,11 @@ PY
 ########################################
 
 install_systemd_service() {
-  log "Installing systemd service (vibevoice-tts.service)..."
+  log "Installing systemd service (${VVT_NAME}.service)..."
 
-  cat > /etc/systemd/system/vibevoice-tts.service <<EOF
+  cat > "/etc/systemd/system/${VVT_NAME}.service" <<EOF
 [Unit]
-Description=VibeVoice multi-speaker TTS (Gradio podcast UI)
+Description=VibeVoice multi-speaker TTS (${VVT_MODEL}, Gradio podcast UI)
 After=network.target
 
 [Service]
@@ -184,9 +201,9 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable vibevoice-tts
-  systemctl restart vibevoice-tts
-  log "Service vibevoice-tts installed and started on port ${VVT_PORT}."
+  systemctl enable "${VVT_NAME}"
+  systemctl restart "${VVT_NAME}"
+  log "Service ${VVT_NAME} installed and started on port ${VVT_PORT}."
 }
 
 ########################################
@@ -215,8 +232,8 @@ main() {
   log "  Access  : http://<EIP>:${VVT_PORT}"
   log "            or ssh -L ${VVT_PORT}:localhost:${VVT_PORT} ubuntu@<EIP>"
   log ""
-  log "  Status  : sudo systemctl status vibevoice-tts"
-  log "  Logs    : sudo journalctl -fu vibevoice-tts"
+  log "  Status  : sudo systemctl status ${VVT_NAME}"
+  log "  Logs    : sudo journalctl -fu ${VVT_NAME}"
 }
 
 main "$@"

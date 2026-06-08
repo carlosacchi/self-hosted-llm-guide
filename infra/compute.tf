@@ -64,9 +64,17 @@ resource "aws_security_group" "llm_gpu" {
   }
 
   ingress {
-    description = "VibeVoice multi-speaker TTS UI"
+    description = "VibeVoice multi-speaker TTS UI (1.5B)"
     from_port   = 7862
     to_port     = 7862
+    protocol    = "tcp"
+    cidr_blocks = [local.ingress_ipv4_cidr]
+  }
+
+  ingress {
+    description = "VibeVoice multi-speaker TTS UI (7B)"
+    from_port   = 7863
+    to_port     = 7863
     protocol    = "tcp"
     cidr_blocks = [local.ingress_ipv4_cidr]
   }
