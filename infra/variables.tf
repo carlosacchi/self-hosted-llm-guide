@@ -2,6 +2,11 @@ variable "aws_region" {
   description = "AWS Region hosting the GPU workload"
   type        = string
   default     = "eu-central-1"
+
+  validation {
+    condition     = contains(["eu-central-1", "eu-west-1", "eu-north-1", "us-east-2"], var.aws_region)
+    error_message = "Supported regions: eu-central-1 (Frankfurt), eu-west-1 (Ireland), eu-north-1 (Stockholm), us-east-2 (Ohio)."
+  }
 }
 
 variable "instance_type" {
@@ -10,8 +15,8 @@ variable "instance_type" {
   default     = "g5.xlarge"
 
   validation {
-    condition     = can(regex("^g5(\\.[A-Za-z0-9_]+)?$", var.instance_type))
-    error_message = "Only g5 family instance types are supported by this module."
+    condition     = contains(["g5.xlarge", "g5.2xlarge", "g5.4xlarge", "g5.8xlarge", "g5.12xlarge", "g5.24xlarge"], var.instance_type)
+    error_message = "Supported instance types: g5.xlarge, g5.2xlarge, g5.4xlarge, g5.8xlarge (single GPU) | g5.12xlarge, g5.24xlarge (multi-GPU)."
   }
 }
 

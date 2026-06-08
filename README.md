@@ -1,8 +1,6 @@
 # Self-Hosted LLM Lab on AWS
 
-Terraform + GitHub Actions to provision a **single GPU EC2 VM** (g5 family) in **`eu-central-1` by default**, with a dedicated VPC, a stable Elastic IP, and a minimal security group. After provisioning, you can bootstrap an Ollama + Open WebUI stack via a helper script.
-
-This repo contains **infrastructure + runbooks**, not an application server implementation.
+Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** (g5 family) across **4 supported AWS regions**, with a dedicated VPC, a stable Elastic IP, and a minimal security group. Provisioning (Ollama + Open WebUI + TTS stack) runs automatically via cloud-init on first boot — **no SSH key or manual steps needed**.
 
 ## What this repository creates
 Terraform under [`infra/`](infra:1) provisions:
@@ -13,6 +11,35 @@ Terraform under [`infra/`](infra:1) provisions:
 - **Ops guardrail**: an EventBridge Scheduler rule to **stop** the instance nightly at **01:00 Europe/Amsterdam**.
 
 Outputs include instance ID, public IP, and an SSH helper command.
+
+## Supported regions
+
+| Region | Location | Notes |
+|---|---|---|
+| `eu-central-1` | Frankfurt, DE | Default; highest EU price |
+| `eu-west-1` | Ireland, IE | Cheapest EU option for g5 |
+| `eu-north-1` | Stockholm, SE | Good EU alternative |
+| `us-east-2` | Ohio, US | Typically lowest overall price |
+
+## Supported instance types
+
+### Single GPU (1× NVIDIA A10G, 24 GB GPU RAM)
+
+| Instance | vCPU | RAM | Storage | Network |
+|---|---|---|---|---|
+| `g5.xlarge` | 4 | 16 GiB | 1×250 GB | Up to 10 Gbps |
+| `g5.2xlarge` | 8 | 32 GiB | 1×450 GB | Up to 10 Gbps |
+| `g5.4xlarge` | 16 | 64 GiB | 1×600 GB | Up to 25 Gbps |
+| `g5.8xlarge` | 32 | 128 GiB | 1×900 GB | 25 Gbps |
+
+### Multi GPU (4× NVIDIA A10G, 96 GB total GPU RAM)
+
+| Instance | vCPU | RAM | Storage | Network |
+|---|---|---|---|---|
+| `g5.12xlarge` | 48 | 192 GiB | 1×3800 GB | 40 Gbps |
+| `g5.24xlarge` | 96 | 384 GiB | 1×3800 GB | 50 Gbps |
+
+> **Cost tip**: `eu-west-1` (Ireland) is typically 10–15% cheaper than `eu-central-1` (Frankfurt) for g5 on-demand. `us-east-2` (Ohio) is usually the cheapest overall.
 
 ## Repository layout
 - [`infra/`](infra:1): Terraform root module.
@@ -51,9 +78,9 @@ Use `destroy` when you want to avoid ongoing charges.
 ## Prerequisites (manual)
 You still need to do a few one-time setup steps:
 
-1. **EC2 key pair**: create/import a key pair in the target region (default: `llm-keypair`).
-2. **Terraform remote state bucket**: create an S3 bucket for the backend (and optionally a DynamoDB table for locking).
-3. **IP allow-list**: set `ipv4_allowed` to a single IPv4 address (your workstation egress IP).
+1. **Terraform remote state bucket**: create an S3 bucket for the backend (one per region you deploy into, or share one bucket with per-region state keys).
+2. **IP allow-list**: set `ipv4_allowed` to a single IPv4 address (your workstation egress IP).
+3. **EC2 key pair** *(optional)*: only needed if you want SSH access. Leave `key_pair_name` blank to rely on cloud-init provisioning alone.
 
 ## Quickstart (GitHub Actions)
 
@@ -64,15 +91,14 @@ You still need to do a few one-time setup steps:
 | `AWS_ACCESS_KEY_ID` | AWS credentials used by the workflow |
 | `AWS_SECRET_ACCESS_KEY` | AWS credentials used by the workflow |
 | `TF_STATE_BUCKET` | S3 bucket name for Terraform backend state |
-| `AWS_REGION` *(optional)* | Overrides default `eu-central-1` |
 
 2. Run the workflow [`.github/workflows/manage-llm-vm.yml`](.github/workflows/manage-llm-vm.yml:1) with:
 
-- `action=apply`
-- `key_pair_name=<your-existing-keypair>`
-- `ipv4_allowed=<your.public.ip.v4>`
-
-Terraform outputs (EIP, SSH command, etc.) are printed in the job logs.
+- `action` — `apply` or `destroy`
+- `instance_type` — pick from the table above (default: `g5.xlarge`)
+- `aws_region` — pick a supported region (default: `eu-central-1`)
+- `ipv4_allowed` — your public IPv4 address
+- `key_pair_name` — optional; leave blank if you don't need SSH access
 
 ## Quickstart (local Terraform)
 
@@ -80,31 +106,26 @@ Terraform outputs (EIP, SSH command, etc.) are printed in the job logs.
 terraform -chdir=infra init \
   -backend-config="bucket=self-hosted-llm-tfstate" \
   -backend-config="key=llm-gpu/terraform.tfstate" \
-  -backend-config="region=eu-central-1"
+  -backend-config="region=eu-west-1"
 
 terraform -chdir=infra apply -auto-approve \
-  -var='key_pair_name=llm-keypair' \
+  -var='aws_region=eu-west-1' \
+  -var='instance_type=g5.xlarge' \
   -var='ipv4_allowed=203.0.113.25'
 ```
 
-## Post-provision: bootstrap Ollama + Open WebUI
+## Post-provision
 
-After Terraform reports success, bootstrap the VM with [`scripts/provision_llm_stack.sh`](scripts/provision_llm_stack.sh:1):
+Provisioning runs **automatically** on first boot via cloud-init (`scripts/user-data.sh`). It downloads and runs:
+1. `provision_llm_stack.sh` — Docker + NVIDIA + Ollama + Open WebUI
+2. `provision_tts_stack.sh` — Kokoro/XTTS/Piper + Gradio TTS UI
 
-```bash
-scp scripts/provision_llm_stack.sh ubuntu@<EIP>:/tmp/
-ssh ubuntu@<EIP> 'chmod +x /tmp/provision_llm_stack.sh'
-ssh ubuntu@<EIP> 'sudo /tmp/provision_llm_stack.sh llama3.2:3b'
-```
+Logs on the VM: `/var/log/llm-lab-bootstrap.log`
 
 When it completes:
-
 - Open WebUI: `http://<EIP>:3000`
-- Ollama API (tunneled):
-  ```bash
-  ssh -L 11434:localhost:11434 ubuntu@<EIP>
-  curl http://localhost:11434/api/tags
-  ```
+- Gradio TTS UI: `http://<EIP>:7860`
+- Ollama API (tunneled): `ssh -L 11434:localhost:11434 ubuntu@<EIP>`
 
 ## Security notes
 - Prefer a single `ipv4_allowed` and keep it updated; it is converted to `/32` internally.

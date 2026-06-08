@@ -18,7 +18,18 @@ on:
           - g5.2xlarge
           - g5.4xlarge
           - g5.8xlarge
+          - g5.12xlarge
+          - g5.24xlarge
         default: g5.xlarge
+      aws_region:
+        description: "AWS region to deploy into (eu-west-1/Ireland is cheapest EU option)"
+        type: choice
+        options:
+          - eu-central-1
+          - eu-west-1
+          - eu-north-1
+          - us-east-2
+        default: eu-central-1
       key_pair_name:
         description: "Optional EC2 key pair name for SSH access. Leave empty: provisioning runs via cloud-init, no key needed."
         required: false
@@ -40,13 +51,13 @@ jobs:
       contents: read
 
     env:
-      AWS_REGION: ${{ secrets.AWS_REGION != '' && secrets.AWS_REGION || 'eu-central-1' }}
+      AWS_REGION: ${{ inputs.aws_region || 'eu-central-1' }}
       TF_STATE_KEY: llm-gpu/terraform.tfstate
       TF_VAR_instance_type: ${{ inputs.instance_type }}
       TF_VAR_key_pair_name: ${{ inputs.key_pair_name }}
       TF_VAR_root_volume_size: ${{ inputs.root_volume_size }}
       TF_VAR_ipv4_allowed: ${{ inputs.ipv4_allowed }}
-      TF_VAR_aws_region: ${{ secrets.AWS_REGION != '' && secrets.AWS_REGION || 'eu-central-1' }}
+      TF_VAR_aws_region: ${{ inputs.aws_region || 'eu-central-1' }}
 
     steps:
       - name: Checkout repository
