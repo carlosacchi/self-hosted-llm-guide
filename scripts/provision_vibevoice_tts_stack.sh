@@ -105,6 +105,15 @@ patch_demo() {
     log "Patching ${demo_py}: bind server_name to 0.0.0.0 ..."
     sed -i 's/server_name="0.0.0.0" if args.share else "127.0.0.1"/server_name="0.0.0.0"/' "${demo_py}"
   fi
+
+  # Upstream builds the UI with a bare `gr.Blocks()`, so the browser tab shows
+  # the generic "Gradio" title. Set an explicit title so the page is
+  # recognizable, matching the convention used by the other stacks
+  # (e.g. "AI Hub — TTS"). Idempotent.
+  if grep -q 'with gr.Blocks() as interface:' "${demo_py}"; then
+    log "Patching ${demo_py}: set browser tab title to 'AI Hub — VibeVoice' ..."
+    sed -i 's/with gr.Blocks() as interface:/with gr.Blocks(title="AI Hub — VibeVoice") as interface:/' "${demo_py}"
+  fi
 }
 
 ########################################
