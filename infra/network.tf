@@ -20,10 +20,36 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
+# Availability zones in the active region that actually offer the requested
+# instance type (g5 GPU instances are not available in every AZ, e.g.
+# eu-north-1a does not offer g5.xlarge). We intersect this with the region's
+# available AZs and pick the first valid one.
+data "aws_ec2_instance_type_offerings" "gpu" {
+  filter {
+    name   = "instance-type"
+    values = [var.instance_type]
+  }
+
+  filter {
+    name   = "location"
+    values = data.aws_availability_zones.available.names
+  }
+
+  location_type = "availability-zone"
+}
+
+locals {
+  # AZs (sorted for determinism) that support the instance type.
+  supported_azs = sort(data.aws_ec2_instance_type_offerings.gpu.locations)
+
+  # Explicit override wins; otherwise use the first AZ that supports the type.
+  selected_az = var.availability_zone != "" ? var.availability_zone : local.supported_azs[0]
+}
+
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.llm.id
   cidr_block              = var.public_subnet_cidr
-  availability_zone       = var.availability_zone != "" ? var.availability_zone : data.aws_availability_zones.available.names[0]
+  availability_zone       = local.selected_az
   map_public_ip_on_launch = true
 
   tags = merge({
