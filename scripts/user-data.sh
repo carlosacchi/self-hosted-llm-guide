@@ -10,8 +10,8 @@
 # Pulling from S3 instead of embedding the scripts keeps user-data well under
 # the 16 KB EC2 limit and supports arbitrarily large scripts.
 #
-# The ${...} placeholders are filled in by Terraform's templatefile()
-# (see infra/compute.tf).
+# The template variables (scripts_bucket, aws_region) are filled in by
+# Terraform's templatefile() (see infra/compute.tf).
 #
 set -euo pipefail
 

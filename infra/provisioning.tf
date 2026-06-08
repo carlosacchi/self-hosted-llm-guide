@@ -56,6 +56,10 @@ resource "aws_s3_object" "scripts" {
   key    = "provisioning/${each.key}"
   source = each.value
   etag   = filemd5(each.value)
+
+  tags = merge({
+    Name = "llm-lab-script-${each.key}"
+  }, local.lab_tags)
 }
 
 # IAM role/instance profile granting the VM read-only access to the scripts.
@@ -109,4 +113,8 @@ resource "aws_iam_instance_profile" "llm_gpu" {
 
   name_prefix = "llm-gpu-"
   role        = aws_iam_role.llm_gpu[0].name
+
+  tags = merge({
+    Name = "llm-gpu-instance-profile"
+  }, local.lab_tags)
 }
