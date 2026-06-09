@@ -38,6 +38,14 @@ if [[ "$EUID" -ne 0 ]]; then
   exit 1
 fi
 
+# On first boot, cloud-init's unattended-upgrades grabs the dpkg/apt lock while
+# our provisioners try to apt-get install. Without this, the first apt-get fails
+# ("Could not get lock /var/lib/dpkg/lock-frontend"), and set -e aborts the whole
+# bootstrap mid-way (e.g. before the portal is installed). Make every apt-get in
+# every sub-script WAIT for the lock (up to 10 min) instead of failing outright.
+log "Configuring apt to wait for the dpkg lock (avoids unattended-upgrades race)..."
+echo 'DPkg::Lock::Timeout "600";' > /etc/apt/apt.conf.d/99llm-lab-lock-timeout
+
 log "=== Step 1/5: Monitoring stack (Netdata dashboard) ==="
 bash "${HERE}/provision_monitoring_stack.sh"
 
