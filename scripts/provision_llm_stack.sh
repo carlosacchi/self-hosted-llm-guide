@@ -155,6 +155,16 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # Keep the loaded model resident in VRAM indefinitely instead of
+      # unloading it after the default 5 min idle. This avoids paying the
+      # multi-minute cold reload (load_duration) on every request after a
+      # pause. Set to e.g. 30m if you prefer it to free VRAM when idle.
+      - OLLAMA_KEEP_ALIVE=-1
+      # Only one model resident at a time. The two big models (qwen3.5:27b
+      # ~17 GB, qwen2.5-coder:32b ~20 GB) can't both fit a 24 GB GPU, so this
+      # stops Ollama from trying to co-load them (which would spill layers to
+      # CPU and crawl). Switching models still reloads, but never offloads.
+      - OLLAMA_MAX_LOADED_MODELS=1
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
