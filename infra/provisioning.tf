@@ -14,6 +14,7 @@ locals {
     "provision_tts_stack.sh"           = "${path.module}/../scripts/provision_tts_stack.sh"
     "provision_vibevoice_stack.sh"     = "${path.module}/../scripts/provision_vibevoice_stack.sh"
     "provision_vibevoice_tts_stack.sh" = "${path.module}/../scripts/provision_vibevoice_tts_stack.sh"
+    "provision_landing_stack.sh"       = "${path.module}/../scripts/provision_landing_stack.sh"
   }
 }
 

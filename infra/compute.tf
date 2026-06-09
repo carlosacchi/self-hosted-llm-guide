@@ -32,6 +32,14 @@ resource "aws_security_group" "llm_gpu" {
   }
 
   ingress {
+    description = "Landing page portal (nginx)"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = [local.ingress_ipv4_cidr]
+  }
+
+  ingress {
     description = "WEB UI"
     from_port   = 3000
     to_port     = 3000
