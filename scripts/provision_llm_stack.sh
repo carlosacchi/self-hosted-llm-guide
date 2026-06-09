@@ -5,8 +5,18 @@ set -euo pipefail
 # Base configuration
 ########################################
 
-# Default models to download (comma-separated, override via first argument)
-DEFAULT_MODELS="${1:-llama3.2:3b,gemma4:26b,qwen3.5:27b}"
+# Default models to download (comma-separated, override via first argument).
+#   llama3.2:3b        : small, fast general-purpose model (~2 GB)
+#   qwen3.5:27b        : 27B MoE multimodal, ~17 GB Q4, 256K context, strong
+#                        all-rounder incl. long-context/agentic coding
+#   qwen2.5-coder:32b  : dedicated code specialist, ~20 GB Q4, 32K context,
+#                        GPT-4o-class on code benchmarks
+#
+# All three live on disk (~39 GB total). VRAM is used lazily: Ollama loads a
+# model only on request and unloads it after keep_alive (~5 min). The two big
+# models (17 + 20 GB) can't both be resident on a 24 GB GPU, so Ollama swaps
+# them in/out on demand (a few-second reload when switching).
+DEFAULT_MODELS="${1:-llama3.2:3b,qwen3.5:27b,qwen2.5-coder:32b}"
 
 # Published ports
 OPENWEBUI_PORT="${OPENWEBUI_PORT:-3000}"

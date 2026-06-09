@@ -4,21 +4,22 @@ set -euo pipefail
 ########################################
 # Bootstrap orchestrator
 #
-# Runs the full provisioning chain in order:
-#   1. provision_monitoring_stack.sh (Netdata system + GPU dashboard)
-#   2. provision_llm_stack.sh        (Docker + NVIDIA + Ollama + Open WebUI)
-#   3. provision_tts_stack.sh             (Kokoro/XTTS/Piper + Gradio TTS UI)
-#   4. provision_vibevoice_stack.sh       (VibeVoice Realtime single-speaker UI)
-#   5. provision_vibevoice_tts_stack.sh   (VibeVoice 1.5B multi-speaker podcast UI)
-#   6. provision_vibevoice_tts_stack.sh   (VibeVoice 7B  multi-speaker podcast UI)
+# Runs the provisioning chain in order:
+#   1. provision_monitoring_stack.sh      (Netdata system + GPU dashboard)
+#   2. provision_llm_stack.sh             (Docker + NVIDIA + Ollama + Open WebUI)
+#   3. provision_tts_stack.sh             (Kokoro/XTTS/Piper + Gradio TTS UI, 7860)
+#   4. provision_vibevoice_tts_stack.sh   (VibeVoice 1.5B multi-speaker UI, 7861)
 #
-# NOTE: steps 5 and 6 run the 1.5B and 7B multi-speaker stacks concurrently on
-# ports 7862 and 7863. The 7B model needs ~16 GB VRAM; running both at once on
-# a single 24 GB GPU (g5.xlarge) is tight and may OOM during long generations.
-# Use a larger GPU or comment out one step if you hit memory pressure.
+# Disabled by default (kept below, commented out, for easy re-enable):
+#   - VibeVoice Realtime single-speaker 0.5B  -> port 7862
+#   - VibeVoice multi-speaker 7B              -> port 7863 (~16 GB VRAM)
 #
-# Intended to be invoked by Terraform's remote-exec after the two
-# scripts have been copied onto the VM, but can also be run by hand:
+# Only one VibeVoice stack runs by default (1.5B). Running the 7B and/or the
+# 0.5B realtime stack at the same time on a single 24 GB GPU (g5.xlarge) is
+# tight and may OOM, so they are left off until explicitly enabled.
+#
+# Intended to be invoked by cloud-init on first boot (see scripts/user-data.sh),
+# but can also be run by hand:
 #
 #   sudo bash bootstrap_all.sh
 #
@@ -36,29 +37,31 @@ if [[ "$EUID" -ne 0 ]]; then
   exit 1
 fi
 
-log "=== Step 1/6: Monitoring stack (Netdata dashboard) ==="
+log "=== Step 1/4: Monitoring stack (Netdata dashboard) ==="
 bash "${HERE}/provision_monitoring_stack.sh"
 
-log "=== Step 2/6: LLM stack (Ollama + Open WebUI) ==="
+log "=== Step 2/4: LLM stack (Ollama + Open WebUI) ==="
 bash "${HERE}/provision_llm_stack.sh"
 
-log "=== Step 3/6: TTS stack (Gradio UI) ==="
+log "=== Step 3/4: TTS stack (Gradio UI, port 7860) ==="
 bash "${HERE}/provision_tts_stack.sh"
 
-log "=== Step 4/6: VibeVoice Realtime TTS stack (single speaker) ==="
-bash "${HERE}/provision_vibevoice_stack.sh"
+log "=== Step 4/4: VibeVoice multi-speaker TTS stack (1.5B podcast, port 7861) ==="
+VVT_PORT=7861 bash "${HERE}/provision_vibevoice_tts_stack.sh"
 
-log "=== Step 5/6: VibeVoice multi-speaker TTS stack (1.5B podcast) ==="
-bash "${HERE}/provision_vibevoice_tts_stack.sh"
-
-log "=== Step 6/6: VibeVoice multi-speaker TTS stack (7B podcast) ==="
-VVT_NAME=vibevoice-tts-7b VVT_PORT=7863 VVT_MODEL=vibevoice/VibeVoice-7B \
-  bash "${HERE}/provision_vibevoice_tts_stack.sh"
+# --- Disabled stacks ---------------------------------------------------------
+# Uncomment a block to install it. Mind the GPU budget on a single 24 GB card:
+# running these alongside the 1.5B stack above may OOM during long generations.
+#
+# VibeVoice Realtime single-speaker 0.5B -> port 7862
+#   VV_PORT=7862 bash "${HERE}/provision_vibevoice_stack.sh"
+#
+# VibeVoice multi-speaker 7B -> port 7863 (~16 GB VRAM)
+#   VVT_NAME=vibevoice-tts-7b VVT_PORT=7863 VVT_MODEL=vibevoice/VibeVoice-7B \
+#     bash "${HERE}/provision_vibevoice_tts_stack.sh"
 
 log "=== All provisioning complete ==="
-log "  Monitoring          : http://<EIP>:19999"
-log "  Open WebUI          : http://<EIP>:3000"
-log "  TTS UI              : http://<EIP>:7860"
-log "  VibeVoice (1 spk)   : http://<EIP>:7861"
-log "  VibeVoice (multi 1.5B): http://<EIP>:7862"
-log "  VibeVoice (multi 7B)  : http://<EIP>:7863"
+log "  Monitoring            : http://<EIP>:19999"
+log "  Open WebUI            : http://<EIP>:3000"
+log "  TTS UI                : http://<EIP>:7860"
+log "  VibeVoice (multi 1.5B): http://<EIP>:7861"
