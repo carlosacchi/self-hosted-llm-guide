@@ -36,6 +36,10 @@ on:
           - eu-north-1
           - us-east-2
         default: eu-central-1
+      availability_zone:
+        description: "Optional AZ override, e.g. eu-west-1b. Leave empty to auto-pick the first g5-capable AZ. Set a specific AZ if you hit InsufficientInstanceCapacity."
+        required: false
+        default: ""
       key_pair_name:
         description: "Optional EC2 key pair name for SSH access. Leave empty: provisioning runs via cloud-init, no key needed."
         required: false
@@ -73,6 +77,7 @@ jobs:
       TF_VAR_root_volume_size: ${{ inputs.root_volume_size }}
       TF_VAR_ipv4_allowed: ${{ inputs.ipv4_allowed }}
       TF_VAR_aws_region: ${{ inputs.aws_region || 'eu-central-1' }}
+      TF_VAR_availability_zone: ${{ inputs.availability_zone }}
 
     steps:
       - name: Checkout repository
