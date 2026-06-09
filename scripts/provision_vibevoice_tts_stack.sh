@@ -123,6 +123,17 @@ patch_demo() {
     sed -i 's/server_name="0.0.0.0" if args.share else "127.0.0.1"/server_name="0.0.0.0"/' "${demo_py}"
   fi
 
+  # On CUDA the demo defaults to flash_attention_2, which is not installed
+  # here. It does fall back to SDPA, but only AFTER from_pretrained() raises,
+  # which means the model is effectively loaded twice (flash attempt + SDPA
+  # retry) — slower startup and a higher peak VRAM spike that can OOM the 7B
+  # model on a 24 GB GPU. Request SDPA directly so the model loads once,
+  # cleanly, with no traceback. Idempotent.
+  if grep -q 'attn_impl_primary = "flash_attention_2"' "${demo_py}"; then
+    log "Patching ${demo_py}: force attn_implementation=sdpa (skip flash_attn) ..."
+    sed -i 's/attn_impl_primary = "flash_attention_2"/attn_impl_primary = "sdpa"/' "${demo_py}"
+  fi
+
   # Upstream builds the UI with a bare `gr.Blocks()`, so the browser tab shows
   # the generic "Gradio" title. Set an explicit title so the page is
   # recognizable, matching the convention used by the other stacks
