@@ -132,6 +132,14 @@ resource "aws_instance" "llm_gpu" {
   user_data = var.run_bootstrap ? templatefile("${path.module}/../scripts/user-data.sh", {
     scripts_bucket = aws_s3_bucket.scripts[0].bucket
     aws_region     = var.aws_region
+
+    # Tool selection flags (rendered as "true"/"false" strings in the script).
+    enable_monitoring         = var.enable_monitoring
+    enable_llm                = var.enable_llm
+    enable_tts                = var.enable_tts
+    enable_vibevoice_15b      = var.enable_vibevoice_15b
+    enable_vibevoice_realtime = var.enable_vibevoice_realtime
+    enable_vibevoice_7b       = var.enable_vibevoice_7b
   }) : null
 
   root_block_device {

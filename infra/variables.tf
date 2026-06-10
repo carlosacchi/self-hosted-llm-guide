@@ -32,6 +32,48 @@ variable "run_bootstrap" {
   default     = true
 }
 
+# --- Tool selection -----------------------------------------------------------
+# Each flag gates one provisioning stack in scripts/bootstrap_all.sh. Mind the
+# GPU VRAM budget: on a single 24 GB GPU (g5.xlarge) you cannot run every model
+# at once (e.g. a 27B LLM + VibeVoice 7B will OOM). Defaults match the previous
+# always-on behavior; the two heavy VibeVoice stacks stay off by default.
+
+variable "enable_monitoring" {
+  description = "Provision the Netdata system + GPU monitoring dashboard (port 19999)."
+  type        = bool
+  default     = true
+}
+
+variable "enable_llm" {
+  description = "Provision the LLM stack: Docker + NVIDIA + Ollama + Open WebUI (ports 3000/11434)."
+  type        = bool
+  default     = true
+}
+
+variable "enable_tts" {
+  description = "Provision the multi-engine TTS stack: Kokoro/XTTS-v2/Piper + Gradio UI (port 7860)."
+  type        = bool
+  default     = true
+}
+
+variable "enable_vibevoice_15b" {
+  description = "Provision the VibeVoice multi-speaker 1.5B podcast TTS UI (port 7861)."
+  type        = bool
+  default     = true
+}
+
+variable "enable_vibevoice_realtime" {
+  description = "Provision the VibeVoice Realtime single-speaker 0.5B streaming UI (port 7862). Off by default (GPU budget)."
+  type        = bool
+  default     = false
+}
+
+variable "enable_vibevoice_7b" {
+  description = "Provision the VibeVoice multi-speaker 7B TTS UI (port 7863, ~16 GB VRAM). Off by default (GPU budget)."
+  type        = bool
+  default     = false
+}
+
 variable "root_volume_size" {
   description = "Root EBS volume size in GiB"
   type        = number

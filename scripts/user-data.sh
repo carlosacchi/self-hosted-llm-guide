@@ -33,8 +33,15 @@ aws s3 cp "s3://${scripts_bucket}/provisioning/" "$PROVISION_DIR/" \
 chmod +x "$PROVISION_DIR"/*.sh
 
 echo "-> Running bootstrap orchestrator..."
+# Tool selection flags, rendered by Terraform's templatefile() as true/false.
+# bootstrap_all.sh reads these env vars to decide which stacks to install.
+export ENABLE_MONITORING="${enable_monitoring}"
+export ENABLE_LLM="${enable_llm}"
+export ENABLE_TTS="${enable_tts}"
+export ENABLE_VIBEVOICE_15B="${enable_vibevoice_15b}"
+export ENABLE_VIBEVOICE_REALTIME="${enable_vibevoice_realtime}"
+export ENABLE_VIBEVOICE_7B="${enable_vibevoice_7b}"
 bash "$PROVISION_DIR/bootstrap_all.sh"
-
 echo "========================================"
 echo "LLM Lab bootstrap complete: $(date)"
 echo "  Logs: $LOG_FILE"

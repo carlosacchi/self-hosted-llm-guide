@@ -51,6 +51,27 @@ on:
       ipv4_allowed:
         description: "Single IPv4 address allowed to reach SSH/Web/FastAPI"
         required: true
+      enable_llm:
+        description: "Deploy the LLM stack (Ollama + Open WebUI, ports 3000/11434)"
+        type: boolean
+        default: true
+      enable_tts:
+        description: "Deploy the multi-engine TTS stack (Kokoro/XTTS/Piper, port 7860)"
+        type: boolean
+        default: true
+      enable_monitoring:
+        description: "Deploy the Netdata monitoring dashboard (port 19999)"
+        type: boolean
+        default: true
+      vibevoice:
+        description: "VibeVoice variant to deploy (they compete for GPU VRAM; pick one). 7B needs ~16 GB."
+        type: choice
+        options:
+          - none
+          - "1.5b"
+          - realtime
+          - "7b"
+        default: "1.5b"
 
 jobs:
   terraform:
@@ -78,6 +99,15 @@ jobs:
       TF_VAR_ipv4_allowed: ${{ inputs.ipv4_allowed }}
       TF_VAR_aws_region: ${{ inputs.aws_region || 'eu-central-1' }}
       TF_VAR_availability_zone: ${{ inputs.availability_zone }}
+      # Tool selection. Booleans render as true/false; the VibeVoice choice is
+      # fanned out into the three independent Terraform flags (single-select,
+      # since the variants compete for the same 24 GB GPU budget).
+      TF_VAR_enable_llm: ${{ inputs.enable_llm }}
+      TF_VAR_enable_tts: ${{ inputs.enable_tts }}
+      TF_VAR_enable_monitoring: ${{ inputs.enable_monitoring }}
+      TF_VAR_enable_vibevoice_15b: ${{ inputs.vibevoice == '1.5b' }}
+      TF_VAR_enable_vibevoice_realtime: ${{ inputs.vibevoice == 'realtime' }}
+      TF_VAR_enable_vibevoice_7b: ${{ inputs.vibevoice == '7b' }}
 
     steps:
       - name: Checkout repository
