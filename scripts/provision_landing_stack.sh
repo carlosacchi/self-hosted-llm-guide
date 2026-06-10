@@ -128,6 +128,7 @@ write_page() {
       { name: "Open WebUI",            desc: "Chat with the local LLMs (llama3.2, qwen3.5, qwen2.5-coder) via Ollama.", port: 3000 },
       { name: "TTS Lab",               desc: "Multi-engine text-to-speech (Kokoro · XTTS · Piper). Text/PDF → audio.", port: 7860 },
       { name: "VibeVoice 1.5B",        desc: "Multi-speaker long-form / podcast TTS with voice cloning.", port: 7861 },
+      { name: "Speech-to-Text",        desc: "Transcribe audio, video, or a YouTube URL to text (Whisper / Granite).", port: 7864 },
       { name: "Netdata Monitoring",    desc: "Live GPU / CPU / RAM / disk / network dashboard.", port: 19999 },
       { name: "Ollama API",            desc: "REST API endpoint for the local models.", port: 11434, tag: "API" },
     ];
@@ -186,7 +187,7 @@ main() {
   log ""
   log "=== Landing page ready ==="
   log "  Portal : http://<EIP>:${LANDING_PORT}/"
-  log "  Lists  : Open WebUI, TTS Lab, VibeVoice 1.5B, Netdata, Ollama API"
+  log "  Lists  : Open WebUI, TTS Lab, VibeVoice 1.5B, Speech-to-Text, Netdata, Ollama API"
 }
 
 main "$@"

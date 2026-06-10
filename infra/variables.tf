@@ -74,6 +74,23 @@ variable "enable_vibevoice_7b" {
   default     = false
 }
 
+variable "enable_asr" {
+  description = "Provision the ASR speech-to-text stack: audio/video/YouTube -> text Gradio UI (port 7864)."
+  type        = bool
+  default     = false
+}
+
+variable "asr_model" {
+  description = "ASR backend model. 'whisper-large-v3' is multilingual (incl. Italian, ~3-5 GB VRAM); 'granite-8b' is EN/FR/DE/ES/PT only (~16-18 GB VRAM)."
+  type        = string
+  default     = "whisper-large-v3"
+
+  validation {
+    condition     = contains(["whisper-large-v3", "granite-8b"], var.asr_model)
+    error_message = "Supported asr_model values: whisper-large-v3, granite-8b."
+  }
+}
+
 variable "root_volume_size" {
   description = "Root EBS volume size in GiB"
   type        = number

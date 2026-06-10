@@ -33,11 +33,15 @@ output "vibevoice_ui_url" {
   value       = "http://${aws_eip.llm_gpu.public_ip}:7861"
 }
 
+output "asr_ui_url" {
+  description = "ASR speech-to-text (audio/video/YouTube -> text) Gradio UI URL"
+  value       = "http://${aws_eip.llm_gpu.public_ip}:7864"
+}
+
 output "monitoring_url" {
   description = "Netdata monitoring dashboard URL (GPU, CPU, RAM, disk)"
   value       = "http://${aws_eip.llm_gpu.public_ip}:19999"
 }
-
 output "ollama_api_url" {
   description = "Ollama REST API base URL (restricted to ipv4_allowed)"
   value       = "http://${aws_eip.llm_gpu.public_ip}:11434"

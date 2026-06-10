@@ -14,6 +14,7 @@ set -euo pipefail
 #   ENABLE_VIBEVOICE_15B       provision_vibevoice_tts_stack.sh   (VibeVoice 1.5B multi-speaker, 7861)
 #   ENABLE_VIBEVOICE_REALTIME  provision_vibevoice_stack.sh       (VibeVoice Realtime 0.5B, 7862)
 #   ENABLE_VIBEVOICE_7B        provision_vibevoice_tts_stack.sh   (VibeVoice 7B multi-speaker, 7863, ~16 GB VRAM)
+#   ENABLE_ASR + ASR_MODEL     provision_asr_stack.sh             (Speech-to-text: audio/video/YouTube -> text, 7864)
 #
 # The landing portal (nginx, port 80) always runs last to index whatever was
 # installed. Defaults (when an env var is unset) match the previous behavior:
@@ -45,6 +46,8 @@ ENABLE_TTS="${ENABLE_TTS:-true}"
 ENABLE_VIBEVOICE_15B="${ENABLE_VIBEVOICE_15B:-true}"
 ENABLE_VIBEVOICE_REALTIME="${ENABLE_VIBEVOICE_REALTIME:-false}"
 ENABLE_VIBEVOICE_7B="${ENABLE_VIBEVOICE_7B:-false}"
+ENABLE_ASR="${ENABLE_ASR:-false}"
+ASR_MODEL="${ASR_MODEL:-whisper-large-v3}"
 
 # True only for the literal string "true" (case-insensitive); anything else off.
 is_enabled() {
@@ -64,7 +67,7 @@ fi
 log "Configuring apt to wait for the dpkg lock (avoids unattended-upgrades race)..."
 echo 'DPkg::Lock::Timeout "600";' > /etc/apt/apt.conf.d/99llm-lab-lock-timeout
 
-log "Selected stacks: monitoring=${ENABLE_MONITORING} llm=${ENABLE_LLM} tts=${ENABLE_TTS} vibevoice_1.5b=${ENABLE_VIBEVOICE_15B} vibevoice_realtime=${ENABLE_VIBEVOICE_REALTIME} vibevoice_7b=${ENABLE_VIBEVOICE_7B}"
+log "Selected stacks: monitoring=${ENABLE_MONITORING} llm=${ENABLE_LLM} tts=${ENABLE_TTS} vibevoice_1.5b=${ENABLE_VIBEVOICE_15B} vibevoice_realtime=${ENABLE_VIBEVOICE_REALTIME} vibevoice_7b=${ENABLE_VIBEVOICE_7B} asr=${ENABLE_ASR}(${ASR_MODEL})"
 
 # Advisory only (non-fatal): the VibeVoice stacks reuse the GPU/NVIDIA setup
 # performed by the LLM stack. If you enable a VibeVoice stack without the LLM
@@ -117,6 +120,13 @@ else
   log "--- Skipping VibeVoice 7B stack (ENABLE_VIBEVOICE_7B=${ENABLE_VIBEVOICE_7B}) ---"
 fi
 
+if is_enabled "${ENABLE_ASR}"; then
+  log "=== ASR speech-to-text stack (model=${ASR_MODEL}, port 7864) ==="
+  ASR_MODEL="${ASR_MODEL}" ASR_PORT=7864 bash "${HERE}/provision_asr_stack.sh"
+else
+  log "--- Skipping ASR stack (ENABLE_ASR=${ENABLE_ASR}) ---"
+fi
+
 log "=== Landing page (nginx portal, port 80) ==="
 bash "${HERE}/provision_landing_stack.sh"
 
@@ -128,3 +138,4 @@ is_enabled "${ENABLE_TTS}"               && log "  TTS UI                      :
 is_enabled "${ENABLE_VIBEVOICE_15B}"     && log "  VibeVoice (multi 1.5B)      : http://<EIP>:7861"
 is_enabled "${ENABLE_VIBEVOICE_REALTIME}" && log "  VibeVoice (realtime 0.5B)   : http://<EIP>:7862"
 is_enabled "${ENABLE_VIBEVOICE_7B}"      && log "  VibeVoice (multi 7B)        : http://<EIP>:7863"
+is_enabled "${ENABLE_ASR}"               && log "  Speech-to-Text (${ASR_MODEL}) : http://<EIP>:7864"

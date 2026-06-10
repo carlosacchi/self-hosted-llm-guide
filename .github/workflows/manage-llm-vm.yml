@@ -1,11 +1,5 @@
 name: Manage GPU VM
 
-# Opt JavaScript actions into Node.js 24. The pinned actions (checkout@v4,
-# configure-aws-credentials@v4, setup-terraform@v3) still ship a Node 20
-# runtime; this silences the deprecation warning and is forward-compatible.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 on:
   workflow_dispatch:
     inputs:
@@ -41,13 +35,9 @@ on:
         required: false
         default: ""
       key_pair_name:
-        description: "Optional EC2 key pair name for SSH access. Leave empty: provisioning runs via cloud-init, no key needed."
+        description: "EC2 key pair name (already created in AWS) for SSH access. Leave empty to deploy without SSH (provisioning still runs via cloud-init)."
         required: false
         default: ""
-      root_volume_size:
-        description: "Root volume size in GiB"
-        required: true
-        default: 200
       ipv4_allowed:
         description: "Single IPv4 address allowed to reach SSH/Web/FastAPI"
         required: true
@@ -59,10 +49,6 @@ on:
         description: "Deploy the multi-engine TTS stack (Kokoro/XTTS/Piper, port 7860)"
         type: boolean
         default: true
-      enable_monitoring:
-        description: "Deploy the Netdata monitoring dashboard (port 19999)"
-        type: boolean
-        default: true
       vibevoice:
         description: "VibeVoice variant to deploy (they compete for GPU VRAM; pick one). 7B needs ~16 GB."
         type: choice
@@ -72,6 +58,19 @@ on:
           - realtime
           - "7b"
         default: "1.5b"
+      asr:
+        description: "Speech-to-text (audio/video/YouTube -> text, port 7864). whisper = multilingual incl. Italian; granite-8b = EN/FR/DE/ES/PT, ~18 GB."
+        type: choice
+        options:
+          - none
+          - whisper-large-v3
+          - granite-8b
+        default: none
+
+# NOTE: workflow_dispatch allows at most 10 inputs. Netdata monitoring is always
+# on (Terraform var enable_monitoring defaults to true) and the root volume size
+# is fixed at the Terraform default (200 GiB); override it via TF_VAR_root_volume_size
+# if you need a different size.
 
 jobs:
   terraform:
@@ -95,33 +94,33 @@ jobs:
       TF_STATE_KEY: llm-gpu/${{ inputs.aws_region || 'eu-central-1' }}/terraform.tfstate
       TF_VAR_instance_type: ${{ inputs.instance_type }}
       TF_VAR_key_pair_name: ${{ inputs.key_pair_name }}
-      TF_VAR_root_volume_size: ${{ inputs.root_volume_size }}
       TF_VAR_ipv4_allowed: ${{ inputs.ipv4_allowed }}
       TF_VAR_aws_region: ${{ inputs.aws_region || 'eu-central-1' }}
       TF_VAR_availability_zone: ${{ inputs.availability_zone }}
-      # Tool selection. Booleans render as true/false; the VibeVoice choice is
-      # fanned out into the three independent Terraform flags (single-select,
+      # Tool selection. Booleans render as true/false; the VibeVoice and ASR
+      # choices are fanned out into independent Terraform flags (single-select,
       # since the variants compete for the same 24 GB GPU budget).
       TF_VAR_enable_llm: ${{ inputs.enable_llm }}
       TF_VAR_enable_tts: ${{ inputs.enable_tts }}
-      TF_VAR_enable_monitoring: ${{ inputs.enable_monitoring }}
       TF_VAR_enable_vibevoice_15b: ${{ inputs.vibevoice == '1.5b' }}
       TF_VAR_enable_vibevoice_realtime: ${{ inputs.vibevoice == 'realtime' }}
       TF_VAR_enable_vibevoice_7b: ${{ inputs.vibevoice == '7b' }}
+      TF_VAR_enable_asr: ${{ inputs.asr != 'none' }}
+      TF_VAR_asr_model: ${{ inputs.asr == 'none' && 'whisper-large-v3' || inputs.asr }}
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.14.1
 

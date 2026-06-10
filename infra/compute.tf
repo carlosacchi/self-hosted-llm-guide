@@ -88,6 +88,14 @@ resource "aws_security_group" "llm_gpu" {
   }
 
   ingress {
+    description = "ASR speech-to-text UI"
+    from_port   = 7864
+    to_port     = 7864
+    protocol    = "tcp"
+    cidr_blocks = [local.ingress_ipv4_cidr]
+  }
+
+  ingress {
     description = "Ollama API"
     from_port   = 11434
     to_port     = 11434
@@ -140,6 +148,8 @@ resource "aws_instance" "llm_gpu" {
     enable_vibevoice_15b      = var.enable_vibevoice_15b
     enable_vibevoice_realtime = var.enable_vibevoice_realtime
     enable_vibevoice_7b       = var.enable_vibevoice_7b
+    enable_asr                = var.enable_asr
+    asr_model                 = var.asr_model
   }) : null
 
   root_block_device {
