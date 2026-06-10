@@ -158,11 +158,20 @@ VRAM free until actually used.
 
 import os
 import subprocess
+import sys
 import tempfile
 
 import gradio as gr
 
 ASR_MODEL = os.environ.get("ASR_MODEL", "whisper-large-v3")
+
+# yt-dlp is installed INTO the venv (…/.venv/bin/yt-dlp). The systemd service
+# does not put the venv's bin/ on PATH, so calling the bare name "yt-dlp" via
+# subprocess fails with FileNotFoundError. Resolve the executable that sits
+# next to this interpreter and fall back to PATH only if it isn't there.
+YT_DLP = os.path.join(os.path.dirname(sys.executable), "yt-dlp")
+if not os.path.exists(YT_DLP):
+    YT_DLP = "yt-dlp"
 
 MODEL_IDS = {
     "whisper-large-v3": "openai/whisper-large-v3",
@@ -214,7 +223,7 @@ def _download_youtube(url: str) -> str:
     # yt-dlp extracts audio to wav; args passed as a list (no shell).
     subprocess.run(
         [
-            "yt-dlp",
+            YT_DLP,
             "-f", "bestaudio/best",
             "-x", "--audio-format", "wav",
             "--no-playlist",
@@ -296,14 +305,59 @@ def _get_whisper():
     return _whisper_pipe
 
 
-def transcribe_whisper(wav_path, lang_code, task):
+def transcribe_whisper(wav_path, lang_code, task, progress=None):
+    """Transcribe in fixed windows so the progress bar advances and no single
+    call has to chew through hours of audio at once.
+
+    A single monolithic pipeline call on very long audio gives no feedback
+    (the bar appears frozen) and can stall. Here we load the whole file once,
+    slice it into WINDOW_S-second windows, transcribe each window, shift its
+    timestamps by the window offset, and report progress per window.
+    """
+    import librosa
+
     pipe = _get_whisper()
     generate_kwargs = {"task": task}
     if lang_code:
         generate_kwargs["language"] = lang_code
-    result = pipe(wav_path, return_timestamps=True, generate_kwargs=generate_kwargs)
-    text = (result.get("text") or "").strip()
-    srt = chunks_to_srt(result.get("chunks") or [])
+
+    # Load as 16 kHz mono float32 (what Whisper expects).
+    audio, _ = librosa.load(wav_path, sr=SAMPLE_RATE, mono=True)
+    total_samples = audio.shape[0]
+    if total_samples == 0:
+        return "", ""
+
+    WINDOW_S = 300                       # 5-minute windows
+    window = WINDOW_S * SAMPLE_RATE
+    n_windows = max(1, (total_samples + window - 1) // window)
+
+    texts = []
+    all_chunks = []
+    for idx in range(n_windows):
+        start = idx * window
+        seg = audio[start:start + window]
+        if seg.shape[0] == 0:
+            continue
+        offset = start / SAMPLE_RATE     # seconds, to shift this window's stamps
+
+        result = pipe(
+            seg, return_timestamps=True, generate_kwargs=generate_kwargs
+        )
+        texts.append((result.get("text") or "").strip())
+        for ch in (result.get("chunks") or []):
+            ts = ch.get("timestamp", (None, None)) or (None, None)
+            s = None if ts[0] is None else ts[0] + offset
+            e = None if ts[1] is None else ts[1] + offset
+            all_chunks.append({"timestamp": (s, e), "text": ch.get("text", "")})
+
+        if progress is not None:
+            done = (idx + 1) / n_windows
+            # Map window progress into the 0.4–1.0 band the callback reserves.
+            progress(0.4 + 0.6 * done,
+                     desc=f"Transcribing… window {idx + 1}/{n_windows}")
+
+    text = " ".join(t for t in texts if t).strip()
+    srt = chunks_to_srt(all_chunks)
     return text, srt
 
 
@@ -386,7 +440,7 @@ def transcribe(audio_path, video_path, youtube_url, language_label, task, progre
     progress(0.4, desc=f"Transcribing with {ASR_MODEL}...")
 
     if IS_WHISPER:
-        text, srt = transcribe_whisper(wav_path, lang_code, task)
+        text, srt = transcribe_whisper(wav_path, lang_code, task, progress)
     else:
         text, srt = transcribe_granite(wav_path, lang_code, task)
 
