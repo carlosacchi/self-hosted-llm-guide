@@ -109,6 +109,12 @@ variable "availability_zone" {
   default     = ""
 }
 
+variable "aws_max_retries" {
+  description = "Max AWS API retry attempts. Kept low so an InsufficientInstanceCapacity error fails in ~1-2 min instead of retrying ~25 times over ~50 min."
+  type        = number
+  default     = 3
+}
+
 variable "additional_tags" {
   description = "Optional tags merged on top of the lab defaults (Environment/Project/ManagedBy)"
   type        = map(string)
