@@ -85,8 +85,30 @@ install_python_packages() {
   "${ASR_DIR}/.venv/bin/pip" install --upgrade pip
 
   # Shared deps: Gradio UI, YouTube download, audio IO, recent transformers.
+  #
+  # Gradio is PINNED to a recent 6.x. Two reasons:
+  #  1) The venv uses --system-site-packages, so an UNPINNED `gradio` is treated
+  #     as already satisfied by the OLD gradio (<4.0) the DLAMI ships and is
+  #     never upgraded (that old build lacks e.g. Textbox(show_copy_button=...)).
+  #  2) Gradio 6 ships gradio_client 2.5.0 (fixes the "argument of type 'bool'
+  #     is not iterable" API-schema crash) and is written against the modern
+  #     starlette 1.x TemplateResponse API. Older gradio 4.x paired with the
+  #     newer starlette that pip pulls in crashed with
+  #     "TypeError: unhashable type: 'dict'" in jinja2, surfacing as the
+  #     misleading "localhost is not accessible" launch error. Pinning gradio 6
+  #     makes it install a self-consistent fastapi/starlette/gradio_client set
+  #     into the venv. (Known gradio issues: #10813, #11090, #11116, #11722.)
+  #
+  # jinja2 and markupsafe are pinned ABOVE the versions Ubuntu 22.04 ships in
+  # /usr/lib/python3/dist-packages (jinja2 3.0.x, markupsafe 2.0.1). Because of
+  # --system-site-packages, an unconstrained requirement would be considered
+  # already satisfied by those stale system copies and never installed into the
+  # venv; the higher floor forces pip to put modern ones in the venv so they
+  # shadow the system packages at runtime.
   "${ASR_DIR}/.venv/bin/pip" install \
-    gradio \
+    "gradio==6.17.3" \
+    "jinja2>=3.1" \
+    "markupsafe>=2.1.1" \
     "yt-dlp" \
     soundfile \
     librosa \
@@ -94,6 +116,9 @@ install_python_packages() {
     "transformers>=4.52.4,<5"
 
   # torchaudio matching the DLAMI's torch (used to load/resample audio tensors).
+  # Newer torch (e.g. 2.12) may not yet have a same-versioned torchaudio wheel;
+  # fall back to the latest torchaudio in that case (mismatch is tolerated; the
+  # default Whisper path uses librosa/soundfile, not torchaudio, for IO).
   TORCH_VER="$("${ASR_DIR}/.venv/bin/python" -c 'import torch; print(torch.__version__.split("+")[0])')"
   "${ASR_DIR}/.venv/bin/pip" install "torchaudio==${TORCH_VER}" || \
     "${ASR_DIR}/.venv/bin/pip" install torchaudio
@@ -408,7 +433,7 @@ with gr.Blocks(title="AI Hub — Speech-to-Text") as demo:
             )
             go = gr.Button("Transcribe", variant="primary")
         with gr.Column():
-            text_out = gr.Textbox(label="Transcript", lines=18, show_copy_button=True)
+            text_out = gr.Textbox(label="Transcript", lines=18)
             txt_dl = gr.File(label="Download .txt")
             srt_dl = gr.File(label="Download .srt (subtitles)", visible=IS_WHISPER)
 

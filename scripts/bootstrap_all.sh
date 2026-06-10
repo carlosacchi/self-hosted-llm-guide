@@ -67,6 +67,52 @@ fi
 log "Configuring apt to wait for the dpkg lock (avoids unattended-upgrades race)..."
 echo 'DPkg::Lock::Timeout "600";' > /etc/apt/apt.conf.d/99llm-lab-lock-timeout
 
+# A 10-min lock wait is not always enough: on the very first boot an
+# unattended-upgrades run can hold the dpkg lock for far longer (large security
+# upgrade set + slow first-boot I/O), so apt-get times out and the bootstrap
+# stalls/aborts (we have seen it hang on "Waiting for cache lock ... held by
+# process N (unattended-upgr)"). Rather than only waiting, proactively stop and
+# disable the automatic apt timers/services for the duration of provisioning so
+# nothing competes for the lock. This is the root-cause fix for the hang.
+disable_unattended_upgrades() {
+  log "Disabling automatic apt/unattended-upgrades to avoid dpkg lock contention..."
+
+  # Stop and disable the timers + services that trigger background apt activity.
+  # '|| true' everywhere: any of these may be absent depending on the AMI.
+  local units=(
+    unattended-upgrades.service
+    apt-daily.service apt-daily.timer
+    apt-daily-upgrade.service apt-daily-upgrade.timer
+  )
+  systemctl stop "${units[@]}" 2>/dev/null || true
+  systemctl disable "${units[@]}" 2>/dev/null || true
+  systemctl mask unattended-upgrades.service apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+
+  # If an unattended-upgrades run is already in flight and holding the lock,
+  # wait briefly for it to exit cleanly, then force-kill any stragglers so the
+  # lock is released before our provisioners start apt-get. dpkg-reconfigure
+  # repairs any interrupted package state left behind by the kill.
+  local waited=0
+  while pgrep -x unattended-upgr >/dev/null 2>&1 && (( waited < 120 )); do
+    log "  waiting for in-flight unattended-upgrades to finish (${waited}s)..."
+    sleep 5
+    waited=$((waited + 5))
+  done
+  if pgrep -x unattended-upgr >/dev/null 2>&1; then
+    log "  unattended-upgrades still running after ${waited}s; terminating it to free the dpkg lock."
+    pkill -x unattended-upgr 2>/dev/null || true
+    sleep 3
+    pkill -9 -x unattended-upgr 2>/dev/null || true
+    sleep 2
+    # Repair any package state interrupted by the kill so later apt-get works.
+    dpkg --configure -a 2>/dev/null || true
+  fi
+
+  log "Automatic apt updates disabled for the provisioning run."
+}
+
+disable_unattended_upgrades
+
 log "Selected stacks: monitoring=${ENABLE_MONITORING} llm=${ENABLE_LLM} tts=${ENABLE_TTS} vibevoice_1.5b=${ENABLE_VIBEVOICE_15B} vibevoice_realtime=${ENABLE_VIBEVOICE_REALTIME} vibevoice_7b=${ENABLE_VIBEVOICE_7B} asr=${ENABLE_ASR}(${ASR_MODEL})"
 
 # Advisory only (non-fatal): the VibeVoice stacks reuse the GPU/NVIDIA setup

@@ -73,8 +73,20 @@ install_python_packages() {
   "${APP_DIR}/.venv/bin/pip" install --upgrade pip
 
   # Core deps (shared + Kokoro engine)
+  #
+  # Gradio is PINNED to a recent 6.x (same rationale as the ASR stack). The venv
+  # uses --system-site-packages, so an UNPINNED `gradio` is treated as already
+  # satisfied by the OLD gradio (<4.0) the DLAMI ships and is never upgraded.
+  # Gradio 6 also pins a self-consistent fastapi/starlette/gradio_client set and
+  # avoids the "unhashable type: 'dict'" / "argument of type 'bool' is not
+  # iterable" crashes that hit older gradio against the newer starlette pip
+  # pulls in. jinja2/markupsafe are pinned ABOVE the stale Ubuntu 22.04 system
+  # versions (jinja2 3.0.x, markupsafe 2.0.1) so pip actually installs modern
+  # ones into the venv past --system-site-packages shadowing.
   "${APP_DIR}/.venv/bin/pip" install \
-    gradio \
+    "gradio==6.17.3" \
+    "jinja2>=3.1" \
+    "markupsafe>=2.1.1" \
     pypdf \
     kokoro \
     soundfile \
