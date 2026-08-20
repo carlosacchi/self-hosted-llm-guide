@@ -1,8 +1,20 @@
-# Self-Hosted LLM Lab on AWS
+# Self-Hosted AI Lab on AWS
 
-Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** (g5 family) across **4 supported AWS regions**. The application stack deploys **automatically via cloud-init on first boot** — no SSH key, no manual steps — and a **service portal on port 80** gives you one clickable index of everything running.
+Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** across **4 supported AWS regions**. The application stack deploys **automatically via cloud-init on first boot** — no SSH key, no manual steps — and a **service portal on port 80** gives you one clickable index of everything running.
 
-The default boot is sized to fit a single 24 GB GPU (`g5.xlarge`): a **landing portal**, **Ollama + Open WebUI** (LLM chat), a **Gradio multi-engine TTS UI**, and **VibeVoice-1.5B multi-speaker** (podcast) TTS. Two heavier VibeVoice stacks — the Realtime-0.5B single-speaker UI and the 7B multi-speaker model — ship in the repo but are **disabled by default** to avoid GPU oversubscription; re-enable them by uncommenting their blocks in `bootstrap_all.sh`.
+Pick one **workload**:
+
+| Workload | Hardware | What runs |
+|---|---|---|
+| `llm-lab` *(default)* | g5 family, 1–4× A10G 24 GB | Ollama + Open WebUI, multi-engine TTS, VibeVoice, optional ASR |
+| `speech-lab` | g5 family | TTS + VibeVoice + ASR, no LLM |
+| `minimax-h3` | **g6e.12xlarge, 4× L40S 48 GB** | [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3) text → video **with synchronized audio**, alone on the box |
+
+The `llm-lab` default is sized to fit a single 24 GB GPU (`g5.xlarge`): a **landing portal**, **Ollama + Open WebUI** (LLM chat), a **Gradio multi-engine TTS UI**, and **VibeVoice-1.5B multi-speaker** (podcast) TTS.
+
+`minimax-h3` is a different animal: a 33B flow-matching diffusion transformer that needs every GPU and most of the host RAM, on an instance that bills at **~$13/hour**. It is mutually exclusive with every other stack, and Terraform refuses to plan a deployment that mixes them. Read [MiniMax-H3](#minimax-h3--video--audio-generation) before running it.
+
+> **Cost guardrails are on by default** for every workload: a hard TTL stops the VM 4 hours after boot, an idle probe stops it after 30 minutes of no GPU work and no traffic, and the pre-existing nightly cron remains as a backstop. See [Cost guardrails](#cost-guardrails).
 
 ---
 
@@ -19,6 +31,9 @@ The default boot is sized to fit a single 24 GB GPU (`g5.xlarge`): a **landing p
 | Monitoring | [Netdata](https://www.netdata.cloud) real-time dashboard (GPU, CPU, RAM, disk) | 19999 | ✅ on |
 | VibeVoice Realtime | [Microsoft VibeVoice-Realtime-0.5B](https://github.com/microsoft/VibeVoice) (single-speaker streaming) | 7862 | ⛔ disabled |
 | VibeVoice 7B | [VibeVoice-7B (community fork)](https://github.com/vibevoice-community/VibeVoice) multi-speaker | 7863 | ⛔ disabled |
+| Speech-to-text | Whisper-large-v3 / Granite-8B (Python venv, GPU) | 7864 | ⛔ disabled |
+| **MiniMax-H3 video** | [SGLang-Diffusion](https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3) serving [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3) (Docker, 4 GPUs) | 30010 | ⛔ workload `minimax-h3` only |
+| MiniMax-H3 UI | Gradio wrapper around the async video API | 7865 | ⛔ workload `minimax-h3` only |
 
 **Default Ollama models** (pulled on first boot): `llama3.2:3b` (small generalist), `qwen3.5:27b` (27B MoE all-rounder, 256K context), `qwen2.5-coder:32b` (code specialist). All three live on disk; Ollama loads them into VRAM lazily and swaps them on demand, so the two large coders never need to fit at the same time. Override via the first argument to `provision_llm_stack.sh`.
 
@@ -39,7 +54,7 @@ The default boot is sized to fit a single 24 GB GPU (`g5.xlarge`): a **landing p
 Terraform under [`infra/`](infra/) provisions:
 
 - **Networking**: VPC (`10.42.0.0/16`), public subnet, internet gateway, route table.
-- **Compute**: EC2 g5 instance on the **AWS Deep Learning AMI (Ubuntu 22.04, NVIDIA drivers pre-installed)**, Elastic IP.
+- **Compute**: EC2 g5 or g6e instance on the **AWS Deep Learning AMI (Ubuntu 22.04, NVIDIA drivers pre-installed — it lists G6e among its supported families, so no AMI change was needed for L40S)**, Elastic IP.
 - **Provisioning**: private encrypted S3 bucket holding the bootstrap scripts; IAM instance profile granting the VM read-only access to that bucket.
 - **Access control**: security group allowing inbound traffic **only from your IP** (`ipv4_allowed`):
   - `22/tcp` — SSH (optional, only if `key_pair_name` is set)
@@ -49,14 +64,43 @@ Terraform under [`infra/`](infra/) provisions:
   - `7861/tcp` — VibeVoice multi-speaker TTS UI (1.5B podcast)
   - `7862/tcp` — VibeVoice Realtime TTS UI (single speaker, disabled by default)
   - `7863/tcp` — VibeVoice 7B multi-speaker TTS UI (disabled by default)
+  - `7864/tcp` — Speech-to-text UI (disabled by default)
+  - `7865/tcp` — MiniMax-H3 video UI (`minimax-h3` workload only)
   - `8000/tcp` — FastAPI (reserved)
   - `11434/tcp` — Ollama REST API
   - `19999/tcp` — Netdata monitoring dashboard
-- **Ops guardrail**: EventBridge Scheduler stops the instance nightly at **01:00 Europe/Amsterdam** to reduce costs.
+  - `30010/tcp` — MiniMax-H3 SGLang REST API (`minimax-h3` workload only)
+- **Ops guardrails**: three independent autostop layers (see below).
+
+### Cost guardrails
+
+A g5.xlarge costs ~$1.20/h, so forgetting it running overnight is a $20 mistake. A **g6e.12xlarge costs ~$13.12/h in eu-central-1** — booting at 09:00 and relying only on a 01:00 nightly cron burns **~$210 in a single day**. So three independent layers stop the VM:
+
+| Layer | Where | Default | Tune with |
+|---|---|---|---|
+| **Hard TTL** | systemd timer, `OnBootSec` | stop **4 h** after boot | `auto_stop_hours` workflow input (`0` disables) |
+| **Idle stop** | systemd timer, probed every 5 min | stop after **30 min** with GPU < 5 % and no connections on the service ports | `idle_stop_minutes` Terraform var |
+| **Nightly cron** | EventBridge Scheduler | **01:00 Europe/Amsterdam** | `infra/operations.tf` |
+
+The in-VM layers call `systemctl poweroff`. Terraform pins `instance_initiated_shutdown_behavior = "stop"`, so an OS shutdown **stops** the instance rather than terminating it — the root volume and any cached models survive untouched, and no extra IAM permissions are needed.
+
+The idle probe deliberately treats these as *busy*, so it never stops a machine that is still working:
+
+- cloud-init has not finished (first boot downloads up to 144 GB with the GPU idle)
+- a service unit is still `activating` (SGLang spends many minutes loading H3's weights at ~0 % GPU)
+- `/run/llm-lab-busy` exists — `sudo touch` it to pin the box up for a long unattended job
+
+Netdata (19999) and the static portal (80) are **excluded** from the activity check: a dashboard left open in a background tab is not work, and counting it would keep the instance alive all night.
+
+```bash
+systemctl list-timers 'llm-lab-*'      # what is armed
+journalctl -t llm-lab-idle             # why it did or did not stop
+sudo nano /etc/llm-lab/autostop.env    # retune without redeploying
+```
 
 ### "Autostop" is not "no-cost"
 
-The scheduler **stops** the instance; it does not destroy it. While stopped you still pay for EBS and the Elastic IP. Run `destroy` when you want zero ongoing charges.
+Every layer **stops** the instance; none destroy it. While stopped you still pay for EBS (a 500 GiB gp3 root volume for H3 is ~$50/month on its own) and the Elastic IP. Run `destroy` when you want zero ongoing charges — but note that destroying an H3 deployment throws away the 144 GB checkpoint, which then has to be re-downloaded next time.
 
 ---
 
@@ -70,6 +114,8 @@ The scheduler **stops** the instance; it does not destroy it. While stopped you 
 | `us-east-2` | Ohio, US | Typically lowest overall price |
 
 > `eu-west-1` is typically 10–15 % cheaper than `eu-central-1` for g5 on-demand. `us-east-2` is usually cheapest.
+
+**For the `minimax-h3` workload the choice is narrower.** `g6e.12xlarge` is not offered in `eu-west-1` at all, and while it exists in `us-east-2` the *Running On-Demand G and VT instances* quota there is commonly 0 on accounts that have never requested it. Terraform therefore restricts `enable_h3` to `eu-central-1` and `eu-north-1`.
 
 ---
 
@@ -91,6 +137,14 @@ The scheduler **stops** the instance; it does not destroy it. While stopped you 
 | `g5.12xlarge` | 48 | 192 GiB | 1×3800 GB | 40 Gbps |
 | `g5.24xlarge` | 96 | 384 GiB | 1×3800 GB | 50 Gbps |
 
+### Video generation — 4× NVIDIA L40S, 192 GB total GPU RAM
+
+| Instance | vCPU | RAM | NVMe | Network | eu-central-1 on-demand |
+|---|---|---|---|---|---|
+| `g6e.12xlarge` | 48 | 384 GiB | 3800 GB | 100 Gbps | **~$13.12/h** |
+
+Required by, and only usable with, the `minimax-h3` workload. Note what those numbers mean in practice: 4 × 46 GB of usable VRAM is **not** enough to hold H3 resident (published datacenter recipes peak at 50–94 GB per GPU), so layerwise offload to host RAM is mandatory — which makes the 384 GiB of host RAM the binding constraint, not the VRAM. L40S also has **no NVLink**, so tensor/sequence parallelism crosses PCIe.
+
 ---
 
 ## Repository layout
@@ -107,13 +161,18 @@ infra/
 
 scripts/
   user-data.sh                  Cloud-init entry point (downloads scripts from S3)
-  bootstrap_all.sh              Orchestrator: monitoring, LLM, TTS, VibeVoice 1.5B, portal (disabled stacks commented out)
+  bootstrap_all.sh              Orchestrator: gates every stack on an ENABLE_* flag
+  lib_docker_gpu.sh             Shared Docker + NVIDIA Container Toolkit setup (sourced, no side effects)
   provision_monitoring_stack.sh Netdata agent + real-time GPU/CPU/RAM/disk dashboard (port 19999)
-  provision_llm_stack.sh        Docker + NVIDIA toolkit + Ollama + Open WebUI
+  provision_llm_stack.sh        Ollama + Open WebUI via docker compose
   provision_tts_stack.sh        Python venv + Kokoro + XTTS-v2 + Piper + Gradio app
   provision_vibevoice_tts_stack.sh  Python venv + VibeVoice-1.5B (community fork) multi-speaker podcast UI (port 7861)
   provision_vibevoice_stack.sh  Python venv + VibeVoice-Realtime-0.5B + web UI (disabled by default, port 7862)
-  provision_landing_stack.sh    nginx + static service portal that links every running app (port 80)
+  provision_asr_stack.sh        Python venv + Whisper/Granite speech-to-text UI (port 7864)
+  provision_h3_stack.sh         NVMe scratch+swap, FL2VA checkpoint, pinned SGLang container (port 30010)
+  provision_h3_ui_stack.sh      Gradio wrapper around the async video API (port 7865)
+  provision_autostop.sh         Hard-TTL and idle-stop systemd timers (all workloads)
+  provision_landing_stack.sh    nginx + service portal listing the stacks that were installed (port 80)
 
 .github/workflows/
   manage-llm-vm.yml       Manual workflow: apply / destroy
@@ -148,13 +207,19 @@ Go to **Actions → Manage GPU VM → Run workflow** and fill in:
 | Input | Description | Default |
 |---|---|---|
 | `action` | `apply` to create, `destroy` to tear down | `apply` |
-| `instance_type` | g5 size (see table above) | `g5.xlarge` |
+| `instance_type` | Instance size (see tables above). `g6e.12xlarge` is required by `minimax-h3` and rejected for anything else | `g5.xlarge` |
 | `aws_region` | Target region (see table above) | `eu-central-1` |
-| `ipv4_allowed` | Your public IPv4 (e.g. `203.0.113.25`) | *(required)* |
-| `root_volume_size` | EBS root volume in GiB | `200` |
+| `availability_zone` | Optional AZ override for `InsufficientInstanceCapacity` | *(blank)* |
 | `key_pair_name` | EC2 key pair name for SSH — leave blank to skip | *(blank)* |
+| `ipv4_allowed` | Your public IPv4 (e.g. `203.0.113.25`) | *(required)* |
+| `workload` | `llm-lab`, `speech-lab`, or `minimax-h3` | `llm-lab` |
+| `vibevoice` | `none` / `1.5b` / `realtime` / `7b` — ignored for `minimax-h3` | `1.5b` |
+| `asr` | `none` / `whisper-large-v3` / `granite-8b` — ignored for `minimax-h3` | `none` |
+| `auto_stop_hours` | Hard TTL from boot; `0` disables it | `4` |
 
-Terraform outputs (Elastic IP, app URLs, SSH command) are printed at the end of the job log.
+> `workflow_dispatch` caps a workflow at **10 inputs** and this list uses all 10. That is why `workload` is a single picker rather than separate `enable_llm` / `enable_tts` booleans — the stacks were never freely combinable anyway (they compete for the same VRAM, and H3 is exclusive by construction). Root volume size and throughput are derived from `workload`; override them with `TF_VAR_root_volume_size` / `TF_VAR_root_volume_throughput`.
+
+Terraform outputs (Elastic IP, app URLs, the H3 curl example, and the active autostop summary) are printed at the end of the job log.
 
 ---
 
@@ -172,6 +237,21 @@ terraform -chdir=infra apply -auto-approve \
   -var='ipv4_allowed=203.0.113.25'
 ```
 
+For the video workload, every other stack has to be off and the volume has to be big and fast:
+
+```bash
+terraform -chdir=infra apply -auto-approve \
+  -var='aws_region=eu-central-1' \
+  -var='instance_type=g6e.12xlarge' \
+  -var='ipv4_allowed=203.0.113.25' \
+  -var='enable_h3=true' \
+  -var='enable_llm=false' -var='enable_tts=false' -var='enable_vibevoice_15b=false' \
+  -var='root_volume_size=500' -var='root_volume_throughput=1000' \
+  -var='auto_stop_hours=3'
+```
+
+Get any of that wrong and Terraform fails during `plan` with an explanation, rather than 20 minutes into a $13/h boot.
+
 ---
 
 ## Provisioning pipeline
@@ -182,41 +262,49 @@ Once Terraform creates the instance, AWS runs `scripts/user-data.sh` as root via
 cloud-init (user-data.sh)
   └── downloads scripts from S3 via IAM instance role
   └── bootstrap_all.sh
-        ├── [1/5] provision_monitoring_stack.sh
+        ├── [1/7] provision_monitoring_stack.sh   (ENABLE_MONITORING)
         │     ├── installs Netdata (stable, no telemetry)
         │     ├── binds dashboard to 0.0.0.0:19999
         │     └── auto-collects GPU (nvidia-smi), CPU, RAM, disk, network
-        ├── [2/5] provision_llm_stack.sh
+        ├── [2/7] provision_llm_stack.sh          (ENABLE_LLM)
         │     ├── installs Docker + NVIDIA Container Toolkit
         │     ├── writes docker-compose.yml (Ollama + Open WebUI)
         │     └── pulls default models (llama3.2:3b, qwen3.5:27b, qwen2.5-coder:32b)
-        ├── [3/5] provision_tts_stack.sh
+        ├── [3/7] provision_tts_stack.sh          (ENABLE_TTS)
         │     ├── installs system deps (ffmpeg, espeak-ng, python3-venv)
         │     ├── creates Python venv (reuses GPU PyTorch from DLAMI)
         │     ├── installs Kokoro, XTTS-v2 (coqui-tts), Piper
         │     ├── downloads Piper voice models (EN US + IT)
         │     ├── writes Gradio app (app.py) with 3 TTS engine tabs
         │     └── registers tts-app.service (systemd, port 7860)
-        ├── [4/5] provision_vibevoice_tts_stack.sh   (VVT_PORT=7861)
+        ├── [4/7] provision_vibevoice_tts_stack.sh   (ENABLE_VIBEVOICE_15B, VVT_PORT=7861)
         │     ├── clones github.com/vibevoice-community/VibeVoice (official TTS code was removed by Microsoft)
         │     ├── creates an isolated Python venv (reuses GPU PyTorch from DLAMI)
         │     ├── installs the community VibeVoice package (editable)
         │     ├── patches the Gradio demo to bind 0.0.0.0 on port 7861 (no public share tunnel)
         │     ├── pre-downloads vibevoice/VibeVoice-1.5B (up to 4 speakers)
         │     └── registers vibevoice-tts.service (systemd, port 7861)
-        └── [5/5] provision_landing_stack.sh
+        ├── [5/7] provision_h3_stack.sh + provision_h3_ui_stack.sh   (ENABLE_H3, exclusive)
+        │     ├── preflight: 4 GPUs, >=350 GiB RAM, >=220 GB free — fail fast, this box is expensive
+        │     ├── installs llm-lab-nvme-scratch.service (NVMe scratch + 256 GiB swap, re-run every boot)
+        │     ├── downloads only the FL2VA partition (~144 GB) into /opt/models on EBS
+        │     ├── pulls the PINNED SGLang image (never :latest)
+        │     ├── registers sglang-h3.service (systemd, port 30010)
+        │     └── registers h3-ui.service (Gradio wrapper, port 7865)
+        ├── [6/7] provision_autostop.sh      (ALWAYS, every workload)
+        │     ├── llm-lab-ttl.timer   → poweroff N hours after boot
+        │     └── llm-lab-idle.timer  → poweroff after N minutes idle
+        └── [7/7] provision_landing_stack.sh
               ├── installs nginx
-              ├── writes a static portal page linking every running service
+              ├── writes a portal page listing the stacks that were actually installed
               └── serves it on port 80 (links built client-side from the host)
-
-  Disabled by default (commented out in bootstrap_all.sh — uncomment to enable):
-    · provision_vibevoice_stack.sh        VibeVoice-Realtime-0.5B single-speaker → port 7862
-    · provision_vibevoice_tts_stack.sh 7B VibeVoice-7B multi-speaker (~16 GB VRAM) → port 7863
 ```
+
+Every stack is gated by an `ENABLE_*` environment variable that Terraform renders into cloud-init, so `bootstrap_all.sh` installs exactly what the `workload` picker asked for. `ENABLE_H3` is enforced as **exclusive**: combining it with any other GPU stack is a hard error in both `terraform plan` and `bootstrap_all.sh`.
 
 **Logs on the VM**: `/var/log/llm-lab-bootstrap.log`
 
-Provisioning takes **15–25 minutes** on a `g5.xlarge` (large Python packages + model downloads). The apps are not reachable until it completes.
+Provisioning takes **15–25 minutes** on a `g5.xlarge` (large Python packages + model downloads), and **30–45 minutes** for `minimax-h3` (the 144 GB checkpoint dominates — which is why that workload provisions a 500 GiB gp3 volume at 1000 MiB/s instead of the 125 MiB/s default). The apps are not reachable until it completes.
 
 ---
 
@@ -229,6 +317,8 @@ Provisioning takes **15–25 minutes** on a `g5.xlarge` (large Python packages +
 | Open WebUI | `http://<EIP>:3000` | LLM chat, model management |
 | Gradio TTS UI | `http://<EIP>:7860` | 3-tab TTS: Kokoro / XTTS-v2 / Piper |
 | VibeVoice TTS UI | `http://<EIP>:7861` | Multi-speaker (1.5B), long-form conversational synthesis |
+| MiniMax-H3 UI | `http://<EIP>:7865` | Text → video + audio (`minimax-h3` workload) |
+| MiniMax-H3 API | `http://<EIP>:30010` | Async video API — see below |
 | Ollama API | `http://<EIP>:11434` | REST API, restricted to your IP — **no auth, anyone on that IP can use the GPU** |
 
 Query the Ollama API directly (from your allowed IP):
@@ -242,6 +332,105 @@ Prefer not to expose it? Keep the `11434` ingress rule out of the security group
 ssh -L 11434:localhost:11434 ubuntu@<EIP>
 curl http://localhost:11434/api/tags
 ```
+
+---
+
+## MiniMax-H3 — video + audio generation
+
+[MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3) is a 33B dense flow-matching diffusion transformer that denoises **joint video and audio latents**: one request returns an H.264 MP4 (24 fps) with a synchronized stereo AAC track (32 kHz), 4–15 seconds long, up to 2K. It is served here by [SGLang-Diffusion](https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3).
+
+```
+                    Internet
+                       │  your IP /32 only
+                  Security Group
+                       │
+              EC2 g6e.12xlarge · 4× L40S 48 GB · 384 GiB RAM
+                       │
+        ┌──────────────┼──────────────┬───────────────┐
+     Netdata      Gradio UI       SGLang          NVMe scratch
+      :19999        :7865          :30010          + 256 GiB swap
+                       └──────────────┤
+                                 MiniMax-H3 (FL2VA)
+                                      │
+                                  /v1/videos → MP4 + audio
+```
+
+### Set expectations before you spend
+
+| | |
+|---|---|
+| Instance cost | **~$13.12/h** on-demand, eu-central-1 |
+| First-boot provisioning | ~30–45 min (144 GB checkpoint + multi-GB container) ≈ **$7–10 before the first video** |
+| Generation time | **~8–15 min for a 5 s clip** ⇒ roughly **$2–3 per video** |
+| Restart from stopped | Weights re-read from EBS, plus offload setup — minutes, not seconds |
+
+The generation estimate is extrapolated, not measured on this exact box: the closest published datapoint is 559 s (~9.3 min) for a 1344×768 / 124-frame / 50-step clip on 2× RTX 5090 with layerwise offload. **L40S has no NVLink**, so parallelism crosses PCIe and the H100/H200 numbers in the SGLang cookbook do not transfer. Measure it on your first run and replace this paragraph.
+
+### Only the FL2VA partition is served
+
+`--model-variant fl2va` covers **both** text-to-video-and-audio (`t2va`) and first/last-frame conditioning (`fl2va`). The `ref2va` partition is deliberately **not** deployed and is rejected by Terraform validation: on 4× L40S (compute capability 8.9) it produces snow/noise on every run while FL2VA is healthy on the identical box — [sgl-project/sglang#34110](https://github.com/sgl-project/sglang/issues/34110).
+
+That also halves the download. The Hugging Face repo is **~498 GB in total** because it ships four overlapping things: a self-contained FL2VA pipeline (144 GB), a self-contained Ref2VA pipeline (144 GB), and a parallel root-level diffusers layout (~210 GB). This stack fetches **only FL2VA plus the small root metadata: ~144 GB**.
+
+### Using the API
+
+The API is **asynchronous — three calls**, not one:
+
+```bash
+# 1. submit
+ID=$(curl -sS http://<EIP>:30010/v1/videos \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "MiniMaxAI/MiniMax-H3",
+    "task": "t2va",
+    "prompt": "A futuristic data center at night, slow dolly shot, humming servers",
+    "seconds": 5,
+    "conditions": [],
+    "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5},
+    "num_inference_steps": 50,
+    "seed": 1101
+  }' | jq -r '.id')
+
+# 2. poll until status is completed (this takes minutes)
+watch -n 10 "curl -sS http://<EIP>:30010/v1/videos/$ID | jq '.status'"
+
+# 3. download
+curl -sS -o out.mp4 "http://<EIP>:30010/v1/videos/$ID/content"
+```
+
+The Gradio UI on `:7865` does all three for you and shows a progress bar.
+
+### Storage layout
+
+| Path | Backing | Survives a stop? | Holds |
+|---|---|---|---|
+| `/opt/models/MiniMax-H3` | root gp3 EBS | ✅ yes | the 144 GB FL2VA checkpoint |
+| `/mnt/nvme/scratch` | instance store | ❌ wiped | temp files, HF metadata, intermediates |
+| `/mnt/nvme/swapfile` | instance store | ❌ recreated on boot | 256 GiB swap cushion |
+
+Instance storage is wiped on every stop, and the autostop guardrails stop this VM several times a day — so the checkpoint lives on EBS and only expendable data goes on NVMe. A `llm-lab-nvme-scratch.service` oneshot re-creates the filesystem, the mount and the swapfile on **every** boot, because cloud-init only runs once.
+
+The swap exists for a specific reason: layerwise offload streams the model through host RAM, and the reference recipe wants **~377 GiB** against this instance's **384 GiB** — a ~2 % margin. Swapping is slow; an OOM kill loses the whole run.
+
+### Tuning when it OOMs
+
+There is no published L40S profile — the SGLang cookbook covers H200, H100, B200, RTX 5090 and RTX 4090. The defaults here start from the 4-GPU datacenter recipe plus the offload flags from the verified memory-constrained one. If the server OOMs while loading weights, edit `/etc/llm-lab-h3.env` and walk down this ladder:
+
+1. `H3_RESIDENT_LAYERS=0` — keep no DiT layers resident (slower, leanest)
+2. `H3_OFFLOAD_PREFETCH=0` — stop prefetching the next layer
+3. `H3_NUM_GPUS=2 H3_TP_SIZE=2 H3_ULYSSES=1 H3_DIT_CPU_OFFLOAD=true` — the exact shape reported working on 4× L40S in sglang#34110
+
+Then `sudo systemctl restart sglang-h3`. Whatever ends up working, commit it to the Terraform defaults so the next deploy does not rediscover it at $13/hour.
+
+```bash
+sudo systemctl status sglang-h3
+sudo journalctl -fu sglang-h3          # weight loading is slow and quiet; watch here
+free -g                                # the number that actually decides success
+```
+
+### Licence
+
+MiniMax-H3 is released under the **MiniMax H3 Community License Agreement**, not Apache/MIT. Read it before any commercial use.
 
 ---
 

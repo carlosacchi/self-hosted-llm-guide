@@ -21,8 +21,59 @@ set -euo pipefail
 LANDING_PORT="${LANDING_PORT:-80}"
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 
+# The same ENABLE_* flags bootstrap_all.sh used to pick the stacks, so the portal
+# lists only what actually got installed instead of advertising dead links.
+# Defaults match bootstrap_all.sh's own defaults for standalone runs.
+ENABLE_MONITORING="${ENABLE_MONITORING:-true}"
+ENABLE_LLM="${ENABLE_LLM:-true}"
+ENABLE_TTS="${ENABLE_TTS:-true}"
+ENABLE_VIBEVOICE_15B="${ENABLE_VIBEVOICE_15B:-true}"
+ENABLE_VIBEVOICE_REALTIME="${ENABLE_VIBEVOICE_REALTIME:-false}"
+ENABLE_VIBEVOICE_7B="${ENABLE_VIBEVOICE_7B:-false}"
+ENABLE_ASR="${ENABLE_ASR:-false}"
+ENABLE_H3="${ENABLE_H3:-false}"
+
 log() {
   echo -e "[provision_landing_stack] $*"
+}
+
+is_enabled() {
+  [[ "${1,,}" == "true" ]]
+}
+
+# Emit one JS object literal per enabled service into the SERVICES array.
+service_entries() {
+  is_enabled "${ENABLE_LLM}" && cat <<'JS'
+      { name: "Open WebUI",            desc: "Chat with the local LLMs (llama3.2, qwen3.5, qwen2.5-coder) via Ollama.", port: 3000 },
+JS
+  is_enabled "${ENABLE_TTS}" && cat <<'JS'
+      { name: "TTS Lab",               desc: "Multi-engine text-to-speech (Kokoro · XTTS · Piper). Text/PDF → audio.", port: 7860 },
+JS
+  is_enabled "${ENABLE_VIBEVOICE_15B}" && cat <<'JS'
+      { name: "VibeVoice 1.5B",        desc: "Multi-speaker long-form / podcast TTS with voice cloning.", port: 7861 },
+JS
+  is_enabled "${ENABLE_VIBEVOICE_REALTIME}" && cat <<'JS'
+      { name: "VibeVoice Realtime",    desc: "Single-speaker 0.5B streaming TTS.", port: 7862 },
+JS
+  is_enabled "${ENABLE_VIBEVOICE_7B}" && cat <<'JS'
+      { name: "VibeVoice 7B",          desc: "Multi-speaker TTS, 7B model (~16 GB VRAM).", port: 7863 },
+JS
+  is_enabled "${ENABLE_ASR}" && cat <<'JS'
+      { name: "Speech-to-Text",        desc: "Transcribe audio, video, or a YouTube URL to text (Whisper / Granite).", port: 7864 },
+JS
+  is_enabled "${ENABLE_H3}" && cat <<'JS'
+      { name: "MiniMax H3",            desc: "Text → video with synchronized stereo audio. Minutes per clip: this model owns the whole GPU box.", port: 7865 },
+JS
+  is_enabled "${ENABLE_MONITORING}" && cat <<'JS'
+      { name: "Netdata Monitoring",    desc: "Live GPU / CPU / RAM / disk / network dashboard.", port: 19999 },
+JS
+  is_enabled "${ENABLE_LLM}" && cat <<'JS'
+      { name: "Ollama API",            desc: "REST API endpoint for the local models.", port: 11434, tag: "API" },
+JS
+  is_enabled "${ENABLE_H3}" && cat <<'JS'
+      { name: "MiniMax H3 API",        desc: "SGLang video API. POST /v1/videos → poll the job → GET /content for the MP4.", port: 30010, tag: "API" },
+JS
+  return 0
 }
 
 require_root() {
@@ -124,13 +175,14 @@ write_page() {
 
   <script>
     // Each entry: name, description, port, optional tag.
+    // Generated at provisioning time from the ENABLE_* flags, so this list
+    // contains only the stacks that were actually installed.
     const SERVICES = [
-      { name: "Open WebUI",            desc: "Chat with the local LLMs (llama3.2, qwen3.5, qwen2.5-coder) via Ollama.", port: 3000 },
-      { name: "TTS Lab",               desc: "Multi-engine text-to-speech (Kokoro · XTTS · Piper). Text/PDF → audio.", port: 7860 },
-      { name: "VibeVoice 1.5B",        desc: "Multi-speaker long-form / podcast TTS with voice cloning.", port: 7861 },
-      { name: "Speech-to-Text",        desc: "Transcribe audio, video, or a YouTube URL to text (Whisper / Granite).", port: 7864 },
-      { name: "Netdata Monitoring",    desc: "Live GPU / CPU / RAM / disk / network dashboard.", port: 19999 },
-      { name: "Ollama API",            desc: "REST API endpoint for the local models.", port: 11434, tag: "API" },
+HTML
+
+  service_entries >> "${WEB_ROOT}/index.html"
+
+  cat >> "${WEB_ROOT}/index.html" <<'HTML'
     ];
 
     const base = (port) => `${window.location.protocol}//${window.location.hostname}:${port}`;
@@ -187,7 +239,7 @@ main() {
   log ""
   log "=== Landing page ready ==="
   log "  Portal : http://<EIP>:${LANDING_PORT}/"
-  log "  Lists  : Open WebUI, TTS Lab, VibeVoice 1.5B, Speech-to-Text, Netdata, Ollama API"
+  log "  Lists  : $(service_entries | sed -n 's/.*name: "\([^"]*\)".*/\1/p' | paste -sd', ' -)"
 }
 
 main "$@"

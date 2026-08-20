@@ -9,12 +9,16 @@
 locals {
   provisioning_scripts = {
     "bootstrap_all.sh"                 = "${path.module}/../scripts/bootstrap_all.sh"
+    "lib_docker_gpu.sh"                = "${path.module}/../scripts/lib_docker_gpu.sh"
     "provision_monitoring_stack.sh"    = "${path.module}/../scripts/provision_monitoring_stack.sh"
     "provision_llm_stack.sh"           = "${path.module}/../scripts/provision_llm_stack.sh"
     "provision_tts_stack.sh"           = "${path.module}/../scripts/provision_tts_stack.sh"
     "provision_vibevoice_stack.sh"     = "${path.module}/../scripts/provision_vibevoice_stack.sh"
     "provision_vibevoice_tts_stack.sh" = "${path.module}/../scripts/provision_vibevoice_tts_stack.sh"
     "provision_asr_stack.sh"           = "${path.module}/../scripts/provision_asr_stack.sh"
+    "provision_h3_stack.sh"            = "${path.module}/../scripts/provision_h3_stack.sh"
+    "provision_h3_ui_stack.sh"         = "${path.module}/../scripts/provision_h3_ui_stack.sh"
+    "provision_autostop.sh"            = "${path.module}/../scripts/provision_autostop.sh"
     "provision_landing_stack.sh"       = "${path.module}/../scripts/provision_landing_stack.sh"
   }
 }

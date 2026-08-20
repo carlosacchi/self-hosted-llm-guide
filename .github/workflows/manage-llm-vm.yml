@@ -11,7 +11,7 @@ on:
           - destroy
         default: apply
       instance_type:
-        description: "g5 instance size to launch"
+        description: "Instance size. g5.* = A10G 24 GB (~$1.2-$7/h). g6e.12xlarge = 4x L40S 48 GB (~$13.1/h in eu-central-1) and is REQUIRED by, and only by, the minimax-h3 workload."
         type: choice
         options:
           - g5.xlarge
@@ -20,6 +20,7 @@ on:
           - g5.8xlarge
           - g5.12xlarge
           - g5.24xlarge
+          - g6e.12xlarge
         default: g5.xlarge
       aws_region:
         description: "AWS region to deploy into (eu-west-1/Ireland is cheapest EU option)"
@@ -41,16 +42,16 @@ on:
       ipv4_allowed:
         description: "Single IPv4 address allowed to reach SSH/Web/FastAPI"
         required: true
-      enable_llm:
-        description: "Deploy the LLM stack (Ollama + Open WebUI, ports 3000/11434)"
-        type: boolean
-        default: true
-      enable_tts:
-        description: "Deploy the multi-engine TTS stack (Kokoro/XTTS/Piper, port 7860)"
-        type: boolean
-        default: true
+      workload:
+        description: "What to run on the GPU. 'llm-lab' = Ollama + Open WebUI + TTS. 'speech-lab' = TTS only (pair with the vibevoice/asr pickers). 'minimax-h3' = MiniMax-H3 video+audio ALONE on the box; it needs g6e.12xlarge and disables every other stack."
+        type: choice
+        options:
+          - llm-lab
+          - speech-lab
+          - minimax-h3
+        default: llm-lab
       vibevoice:
-        description: "VibeVoice variant to deploy (they compete for GPU VRAM; pick one). 7B needs ~16 GB."
+        description: "VibeVoice variant to deploy (they compete for GPU VRAM; pick one). 7B needs ~16 GB. Ignored when workload is minimax-h3."
         type: choice
         options:
           - none
@@ -59,18 +60,33 @@ on:
           - "7b"
         default: "1.5b"
       asr:
-        description: "Speech-to-text (audio/video/YouTube -> text, port 7864). whisper = multilingual incl. Italian; granite-8b = EN/FR/DE/ES/PT, ~18 GB."
+        description: "Speech-to-text (audio/video/YouTube -> text, port 7864). whisper = multilingual incl. Italian; granite-8b = EN/FR/DE/ES/PT, ~18 GB. Ignored when workload is minimax-h3."
         type: choice
         options:
           - none
           - whisper-large-v3
           - granite-8b
         default: none
+      auto_stop_hours:
+        description: "Hard time-to-live: stop the VM this many hours after boot, whatever happens. '0' disables it. Idle-stop (30 min) and the 01:00 nightly cron apply on top."
+        type: choice
+        options:
+          - "2"
+          - "4"
+          - "8"
+          - "0"
+        default: "4"
 
-# NOTE: workflow_dispatch allows at most 10 inputs. Netdata monitoring is always
-# on (Terraform var enable_monitoring defaults to true) and the root volume size
-# is fixed at the Terraform default (200 GiB); override it via TF_VAR_root_volume_size
-# if you need a different size.
+# NOTE: workflow_dispatch allows at most 10 inputs and this list uses all 10.
+#
+# That cap is why 'workload' exists as a single picker instead of separate
+# enable_llm / enable_tts booleans: adding MiniMax-H3 needed a slot, and the
+# stacks were never freely combinable anyway (they compete for the same VRAM,
+# and H3 is exclusive by construction).
+#
+# Netdata monitoring is always on (Terraform var enable_monitoring defaults to
+# true). Root volume size is derived from the workload below; override it with
+# TF_VAR_root_volume_size if you need something else.
 
 jobs:
   terraform:
@@ -97,16 +113,32 @@ jobs:
       TF_VAR_ipv4_allowed: ${{ inputs.ipv4_allowed }}
       TF_VAR_aws_region: ${{ inputs.aws_region || 'eu-central-1' }}
       TF_VAR_availability_zone: ${{ inputs.availability_zone }}
-      # Tool selection. Booleans render as true/false; the VibeVoice and ASR
-      # choices are fanned out into independent Terraform flags (single-select,
-      # since the variants compete for the same 24 GB GPU budget).
-      TF_VAR_enable_llm: ${{ inputs.enable_llm }}
-      TF_VAR_enable_tts: ${{ inputs.enable_tts }}
-      TF_VAR_enable_vibevoice_15b: ${{ inputs.vibevoice == '1.5b' }}
-      TF_VAR_enable_vibevoice_realtime: ${{ inputs.vibevoice == 'realtime' }}
-      TF_VAR_enable_vibevoice_7b: ${{ inputs.vibevoice == '7b' }}
-      TF_VAR_enable_asr: ${{ inputs.asr != 'none' }}
+      # Tool selection. The single 'workload' picker is fanned out into the
+      # independent Terraform flags, same technique already used for the
+      # VibeVoice and ASR variants (single-select, since they compete for the
+      # same VRAM budget).
+      #
+      # minimax-h3 forces every other GPU stack off: Terraform enforces the same
+      # rule with a precondition, so a hand-edited run still fails in `plan`
+      # rather than OOMing 20 minutes into a $13/h boot.
+      TF_VAR_enable_h3: ${{ inputs.workload == 'minimax-h3' }}
+      TF_VAR_enable_llm: ${{ inputs.workload == 'llm-lab' }}
+      TF_VAR_enable_tts: ${{ inputs.workload == 'llm-lab' || inputs.workload == 'speech-lab' }}
+      TF_VAR_enable_vibevoice_15b: ${{ inputs.workload != 'minimax-h3' && inputs.vibevoice == '1.5b' }}
+      TF_VAR_enable_vibevoice_realtime: ${{ inputs.workload != 'minimax-h3' && inputs.vibevoice == 'realtime' }}
+      TF_VAR_enable_vibevoice_7b: ${{ inputs.workload != 'minimax-h3' && inputs.vibevoice == '7b' }}
+      TF_VAR_enable_asr: ${{ inputs.workload != 'minimax-h3' && inputs.asr != 'none' }}
       TF_VAR_asr_model: ${{ inputs.asr == 'none' && 'whisper-large-v3' || inputs.asr }}
+
+      # H3 needs room for the 144 GB FL2VA partition plus the SGLang image, and
+      # gp3's default 125 MiB/s would spend ~19 minutes just writing those
+      # weights (and re-reading them on every later boot). 1000 MiB/s cuts that
+      # to a couple of minutes for a few dollars a month.
+      TF_VAR_root_volume_size: ${{ inputs.workload == 'minimax-h3' && '500' || '200' }}
+      TF_VAR_root_volume_throughput: ${{ inputs.workload == 'minimax-h3' && '1000' || '125' }}
+
+      # Cost guardrails (see scripts/provision_autostop.sh).
+      TF_VAR_auto_stop_hours: ${{ inputs.auto_stop_hours }}
 
     steps:
       - name: Checkout repository

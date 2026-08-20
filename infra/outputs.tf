@@ -38,6 +38,36 @@ output "asr_ui_url" {
   value       = "http://${aws_eip.llm_gpu.public_ip}:7864"
 }
 
+output "h3_ui_url" {
+  description = "MiniMax-H3 video+audio generation Gradio UI URL (empty unless enable_h3)"
+  value       = var.enable_h3 ? "http://${aws_eip.llm_gpu.public_ip}:7865" : ""
+}
+
+output "h3_api_url" {
+  description = "MiniMax-H3 SGLang REST base URL (empty unless enable_h3). The API is asynchronous: POST /v1/videos -> GET /v1/videos/{id} until status is completed -> GET /v1/videos/{id}/content for the MP4."
+  value       = var.enable_h3 ? "http://${aws_eip.llm_gpu.public_ip}:30010" : ""
+}
+
+output "h3_curl_example" {
+  description = "Ready-to-paste smoke test for the H3 REST API"
+  value = var.enable_h3 ? join("\n", [
+    "curl -sS http://${aws_eip.llm_gpu.public_ip}:30010/v1/videos \\",
+    "  -H 'Content-Type: application/json' \\",
+    "  -d '{\"model\":\"MiniMaxAI/MiniMax-H3\",\"task\":\"t2va\",\"prompt\":\"A futuristic data center at night, slow dolly shot\",\"seconds\":5,\"conditions\":[],\"target\":{\"short_edge\":768,\"aspect_ratio\":\"16:9\",\"duration_seconds\":5},\"num_inference_steps\":50,\"seed\":1101}'",
+    "# then poll: curl http://${aws_eip.llm_gpu.public_ip}:30010/v1/videos/<id>",
+    "# then fetch: curl -o out.mp4 http://${aws_eip.llm_gpu.public_ip}:30010/v1/videos/<id>/content",
+  ]) : ""
+}
+
+output "auto_stop_summary" {
+  description = "Active cost guardrails. Three independent layers stop the VM; the nightly cron is only the last one."
+  value = join(" | ", [
+    var.auto_stop_hours > 0 ? "hard TTL: stops ${var.auto_stop_hours}h after boot" : "hard TTL: DISABLED",
+    var.idle_stop_minutes > 0 ? "idle stop: after ${var.idle_stop_minutes}min idle" : "idle stop: DISABLED",
+    "nightly cron: 01:00 Europe/Amsterdam",
+  ])
+}
+
 output "monitoring_url" {
   description = "Netdata monitoring dashboard URL (GPU, CPU, RAM, disk)"
   value       = "http://${aws_eip.llm_gpu.public_ip}:19999"

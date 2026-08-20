@@ -43,7 +43,9 @@ locals {
   supported_azs = sort(data.aws_ec2_instance_type_offerings.gpu.locations)
 
   # Explicit override wins; otherwise use the first AZ that supports the type.
-  selected_az = var.availability_zone != "" ? var.availability_zone : local.supported_azs[0]
+  # try() keeps an unsupported region from failing here with a bare "Invalid
+  # index"; the subnet precondition below explains what actually went wrong.
+  selected_az = var.availability_zone != "" ? var.availability_zone : try(local.supported_azs[0], "")
 }
 
 resource "aws_subnet" "public" {
@@ -51,6 +53,13 @@ resource "aws_subnet" "public" {
   cidr_block              = var.public_subnet_cidr
   availability_zone       = local.selected_az
   map_public_ip_on_launch = true
+
+  lifecycle {
+    precondition {
+      condition     = local.selected_az != ""
+      error_message = "Instance type ${var.instance_type} is not offered in any availability zone of ${var.aws_region}. Pick another region: g6e.12xlarge, for example, exists in eu-central-1 and eu-north-1 but not in eu-west-1."
+    }
+  }
 
   tags = merge({
     Name = "llm-gpu-public"

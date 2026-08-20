@@ -15,14 +15,21 @@ set -euo pipefail
 #   ENABLE_VIBEVOICE_REALTIME  provision_vibevoice_stack.sh       (VibeVoice Realtime 0.5B, 7862)
 #   ENABLE_VIBEVOICE_7B        provision_vibevoice_tts_stack.sh   (VibeVoice 7B multi-speaker, 7863, ~16 GB VRAM)
 #   ENABLE_ASR + ASR_MODEL     provision_asr_stack.sh             (Speech-to-text: audio/video/YouTube -> text, 7864)
+#   ENABLE_H3 + H3_VARIANT     provision_h3_stack.sh              (MiniMax-H3 video+audio, 30010 + UI 7865)
 #
-# The landing portal (nginx, port 80) always runs last to index whatever was
-# installed. Defaults (when an env var is unset) match the previous behavior:
-# monitoring/llm/tts/vibevoice-1.5B ON, realtime + 7B OFF.
+# The autostop guardrails (provision_autostop.sh) and the landing portal
+# (nginx, port 80) always run last. Defaults (when an env var is unset) match
+# the previous behavior: monitoring/llm/tts/vibevoice-1.5B ON, realtime + 7B OFF.
 #
 # Mind the GPU budget: on a single 24 GB GPU (g5.xlarge) you cannot run every
 # model at once (e.g. a 27B LLM + VibeVoice 7B will OOM). Pick a combo that
 # fits, or use a larger GPU.
+#
+# ENABLE_H3 is different in kind: MiniMax-H3 is a 33B flow-matching DiT that
+# needs all 4 L40S of a g6e.12xlarge plus most of the 384 GiB of host RAM for
+# layerwise offload. It is EXCLUSIVE - enabling it alongside any other GPU stack
+# is a hard error, not a warning, because on a ~$13/h box a bootstrap that OOMs
+# halfway through is money burned for nothing.
 #
 # Intended to be invoked by cloud-init on first boot (see scripts/user-data.sh),
 # but can also be run by hand, optionally overriding flags:
@@ -48,6 +55,13 @@ ENABLE_VIBEVOICE_REALTIME="${ENABLE_VIBEVOICE_REALTIME:-false}"
 ENABLE_VIBEVOICE_7B="${ENABLE_VIBEVOICE_7B:-false}"
 ENABLE_ASR="${ENABLE_ASR:-false}"
 ASR_MODEL="${ASR_MODEL:-whisper-large-v3}"
+ENABLE_H3="${ENABLE_H3:-false}"
+H3_VARIANT="${H3_VARIANT:-fl2va}"
+H3_SGLANG_IMAGE="${H3_SGLANG_IMAGE:-lmsysorg/sglang:v0.5.17-cu129}"
+
+# Cost guardrails (see provision_autostop.sh). Installed for every workload.
+AUTO_STOP_HOURS="${AUTO_STOP_HOURS:-4}"
+IDLE_STOP_MINUTES="${IDLE_STOP_MINUTES:-30}"
 
 # True only for the literal string "true" (case-insensitive); anything else off.
 is_enabled() {
@@ -113,7 +127,37 @@ disable_unattended_upgrades() {
 
 disable_unattended_upgrades
 
-log "Selected stacks: monitoring=${ENABLE_MONITORING} llm=${ENABLE_LLM} tts=${ENABLE_TTS} vibevoice_1.5b=${ENABLE_VIBEVOICE_15B} vibevoice_realtime=${ENABLE_VIBEVOICE_REALTIME} vibevoice_7b=${ENABLE_VIBEVOICE_7B} asr=${ENABLE_ASR}(${ASR_MODEL})"
+log "Selected stacks: monitoring=${ENABLE_MONITORING} llm=${ENABLE_LLM} tts=${ENABLE_TTS} vibevoice_1.5b=${ENABLE_VIBEVOICE_15B} vibevoice_realtime=${ENABLE_VIBEVOICE_REALTIME} vibevoice_7b=${ENABLE_VIBEVOICE_7B} asr=${ENABLE_ASR}(${ASR_MODEL}) h3=${ENABLE_H3}(${H3_VARIANT})"
+log "Cost guardrails: hard TTL=${AUTO_STOP_HOURS}h idle stop=${IDLE_STOP_MINUTES}min (0 = disabled)"
+
+# Hard guard, not a warning. Terraform already blocks this combination in
+# `plan` (preconditions in infra/compute.tf), but bootstrap_all.sh is also run
+# by hand, and on a g6e.12xlarge every wasted minute is real money.
+if is_enabled "${ENABLE_H3}"; then
+  conflicting=()
+  is_enabled "${ENABLE_LLM}"                && conflicting+=("llm")
+  is_enabled "${ENABLE_TTS}"                && conflicting+=("tts")
+  is_enabled "${ENABLE_VIBEVOICE_15B}"      && conflicting+=("vibevoice_1.5b")
+  is_enabled "${ENABLE_VIBEVOICE_REALTIME}" && conflicting+=("vibevoice_realtime")
+  is_enabled "${ENABLE_VIBEVOICE_7B}"       && conflicting+=("vibevoice_7b")
+  is_enabled "${ENABLE_ASR}"                && conflicting+=("asr")
+
+  if (( ${#conflicting[@]} > 0 )); then
+    log "FATAL: ENABLE_H3=true cannot be combined with: ${conflicting[*]}"
+    log "       MiniMax-H3 needs all 4 GPUs and most of the host RAM for layerwise"
+    log "       offload. Sharing the box guarantees an OOM partway through a costly"
+    log "       boot. Disable the other stacks (monitoring may stay on) and re-run."
+    exit 1
+  fi
+
+  if [[ "${H3_VARIANT,,}" != "fl2va" ]]; then
+    log "FATAL: H3_VARIANT='${H3_VARIANT}' is not supported; only 'fl2va' is."
+    log "       The ref2va partition produces snow/noise on every run on L40S-class"
+    log "       GPUs (compute capability 8.9): https://github.com/sgl-project/sglang/issues/34110"
+    log "       fl2va already serves both t2va and first/last-frame conditioning."
+    exit 1
+  fi
+fi
 
 # Advisory only (non-fatal): the VibeVoice stacks reuse the GPU/NVIDIA setup
 # performed by the LLM stack. If you enable a VibeVoice stack without the LLM
@@ -173,8 +217,34 @@ else
   log "--- Skipping ASR stack (ENABLE_ASR=${ENABLE_ASR}) ---"
 fi
 
+if is_enabled "${ENABLE_H3}"; then
+  log "=== MiniMax-H3 video+audio stack (SGLang REST 30010, variant=${H3_VARIANT}) ==="
+  H3_VARIANT="${H3_VARIANT}" H3_SGLANG_IMAGE="${H3_SGLANG_IMAGE}" \
+    bash "${HERE}/provision_h3_stack.sh"
+
+  log "=== MiniMax-H3 Gradio UI (port 7865) ==="
+  H3_UI_PORT=7865 bash "${HERE}/provision_h3_ui_stack.sh"
+else
+  log "--- Skipping MiniMax-H3 stack (ENABLE_H3=${ENABLE_H3}) ---"
+fi
+
+# Always installed: the guardrails matter most on exactly the runs where you
+# forgot to think about them.
+log "=== Autostop guardrails (TTL + idle stop) ==="
+AUTO_STOP_HOURS="${AUTO_STOP_HOURS}" IDLE_STOP_MINUTES="${IDLE_STOP_MINUTES}" \
+  bash "${HERE}/provision_autostop.sh"
+
 log "=== Landing page (nginx portal, port 80) ==="
-bash "${HERE}/provision_landing_stack.sh"
+# Pass the selection through so the portal lists only what was installed.
+ENABLE_MONITORING="${ENABLE_MONITORING}" \
+ENABLE_LLM="${ENABLE_LLM}" \
+ENABLE_TTS="${ENABLE_TTS}" \
+ENABLE_VIBEVOICE_15B="${ENABLE_VIBEVOICE_15B}" \
+ENABLE_VIBEVOICE_REALTIME="${ENABLE_VIBEVOICE_REALTIME}" \
+ENABLE_VIBEVOICE_7B="${ENABLE_VIBEVOICE_7B}" \
+ENABLE_ASR="${ENABLE_ASR}" \
+ENABLE_H3="${ENABLE_H3}" \
+  bash "${HERE}/provision_landing_stack.sh"
 
 log "=== All provisioning complete ==="
 log "  Portal (start here)         : http://<EIP>/"
@@ -185,3 +255,8 @@ is_enabled "${ENABLE_VIBEVOICE_15B}"     && log "  VibeVoice (multi 1.5B)      :
 is_enabled "${ENABLE_VIBEVOICE_REALTIME}" && log "  VibeVoice (realtime 0.5B)   : http://<EIP>:7862"
 is_enabled "${ENABLE_VIBEVOICE_7B}"      && log "  VibeVoice (multi 7B)        : http://<EIP>:7863"
 is_enabled "${ENABLE_ASR}"               && log "  Speech-to-Text (${ASR_MODEL}) : http://<EIP>:7864"
+is_enabled "${ENABLE_H3}"                && log "  MiniMax-H3 video UI         : http://<EIP>:7865"
+is_enabled "${ENABLE_H3}"                && log "  MiniMax-H3 REST API         : http://<EIP>:30010/v1/videos"
+log ""
+log "  Autostop: hard TTL=${AUTO_STOP_HOURS}h, idle stop=${IDLE_STOP_MINUTES}min, nightly cron 01:00."
+log "  Check it with: systemctl list-timers 'llm-lab-*'"
