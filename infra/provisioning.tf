@@ -117,6 +117,40 @@ resource "aws_iam_role_policy" "scripts_read" {
   policy      = data.aws_iam_policy_document.scripts_read[0].json
 }
 
+# The Auto Scaling group chooses the AZ and therefore the instance, so Terraform
+# cannot attach the Elastic IP itself any more. The instance claims it on first
+# boot (see scripts/user-data.sh). AssociateAddress authorises against all three
+# resources involved, so the address alone is not a sufficient scope.
+data "aws_caller_identity" "current" {}
+
+data "aws_iam_policy_document" "claim_eip" {
+  count = var.run_bootstrap ? 1 : 0
+
+  statement {
+    sid     = "ClaimElasticIp"
+    actions = ["ec2:AssociateAddress"]
+    resources = [
+      aws_eip.llm_gpu.arn,
+      "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/*",
+      "arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:network-interface/*",
+    ]
+  }
+
+  statement {
+    sid       = "DescribeElasticIps"
+    actions   = ["ec2:DescribeAddresses"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "claim_eip" {
+  count = var.run_bootstrap ? 1 : 0
+
+  name_prefix = "claim-eip-"
+  role        = aws_iam_role.llm_gpu[0].id
+  policy      = data.aws_iam_policy_document.claim_eip[0].json
+}
+
 resource "aws_iam_instance_profile" "llm_gpu" {
   count = var.run_bootstrap ? 1 : 0
 

@@ -1,6 +1,6 @@
 # Self-Hosted AI Lab on AWS
 
-Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** across **4 supported AWS regions**. The application stack deploys **automatically via cloud-init on first boot** — no SSH key, no manual steps — and a **service portal on port 80** gives you one clickable index of everything running.
+Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** across **5 supported AWS regions**. The VM is launched by an **Auto Scaling group that hunts for GPU capacity** across every compatible instance type and availability zone, and the application stack deploys **automatically via cloud-init on first boot** — no SSH key, no manual steps — with a **service portal on port 80** giving you one clickable index of everything running.
 
 Pick one **workload**:
 
@@ -8,13 +8,13 @@ Pick one **workload**:
 |---|---|---|
 | `llm-lab` *(default)* | g5 family, 1–4× A10G 24 GB | Ollama + Open WebUI, multi-engine TTS, VibeVoice, optional ASR |
 | `speech-lab` | g5 family | TTS + VibeVoice + ASR, no LLM |
-| `minimax-h3` | **g6e.12xlarge, 4× L40S 48 GB** | [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3) text → video **with synchronized audio**, alone on the box |
+| `minimax-h3` | **g6e.12xlarge (4× L40S 48 GB) or g7e.12xlarge (2× RTX PRO 6000 96 GB)** | [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3) text → video **with synchronized audio**, alone on the box |
 
 The `llm-lab` default is sized to fit a single 24 GB GPU (`g5.xlarge`): a **landing portal**, **Ollama + Open WebUI** (LLM chat), a **Gradio multi-engine TTS UI**, and **VibeVoice-1.5B multi-speaker** (podcast) TTS.
 
 `minimax-h3` is a different animal: a 33B flow-matching diffusion transformer that needs every GPU and most of the host RAM, on an instance that bills at **~$13/hour**. It is mutually exclusive with every other stack, and Terraform refuses to plan a deployment that mixes them. Read [MiniMax-H3](#minimax-h3--video--audio-generation) before running it.
 
-> **Cost guardrails are on by default** for every workload: a hard TTL stops the VM 4 hours after boot, an idle probe stops it after 30 minutes of no GPU work and no traffic, and the pre-existing nightly cron remains as a backstop. See [Cost guardrails](#cost-guardrails).
+> **Cost guardrails are on by default** for every workload: a hard TTL stops the VM 4 hours after boot, an idle probe stops it after 30 minutes of no GPU work and no traffic, and a nightly schedule scales the group to zero as a backstop. See [Cost guardrails](#cost-guardrails).
 
 ---
 
@@ -53,9 +53,9 @@ The `llm-lab` default is sized to fit a single 24 GB GPU (`g5.xlarge`): a **land
 
 Terraform under [`infra/`](infra/) provisions:
 
-- **Networking**: VPC (`10.42.0.0/16`), public subnet, internet gateway, route table.
-- **Compute**: EC2 g5 or g6e instance on the **AWS Deep Learning AMI (Ubuntu 22.04, NVIDIA drivers pre-installed — it lists G6e among its supported families, so no AMI change was needed for L40S)**, Elastic IP.
-- **Provisioning**: private encrypted S3 bucket holding the bootstrap scripts; IAM instance profile granting the VM read-only access to that bucket.
+- **Networking**: VPC (`10.42.0.0/16`), **one public `/24` subnet per capable availability zone**, internet gateway, route table.
+- **Compute**: a **launch template** on the AWS Deep Learning AMI (Ubuntu 22.04, NVIDIA drivers pre-installed — it lists G6e among its supported families, so no AMI change was needed for L40S), plus an **Auto Scaling group** (`min=0`, `max=1`) that finds a GPU for it. An Elastic IP is allocated up front and claimed by the instance on boot.
+- **Provisioning**: private encrypted S3 bucket holding the bootstrap scripts; IAM instance profile granting the VM read-only access to that bucket and permission to associate its own Elastic IP.
 - **Access control**: security group allowing inbound traffic **only from your IP** (`ipv4_allowed`):
   - `22/tcp` — SSH (optional, only if `key_pair_name` is set)
   - `80/tcp` — Service portal (nginx landing page)
@@ -72,17 +72,57 @@ Terraform under [`infra/`](infra/) provisions:
   - `30010/tcp` — MiniMax-H3 SGLang REST API (`minimax-h3` workload only)
 - **Ops guardrails**: three independent autostop layers (see below).
 
+### Capacity hunting, not autoscaling
+
+`g6e.12xlarge` and `g7e.12xlarge` pools are **thin per availability zone**, and there is no AWS API that tells you whether a pool has capacity before you try to launch into it. A single `aws_instance` gets exactly one attempt at exactly one pool:
+
+```
+aws_instance -> one type, one AZ -> InsufficientInstanceCapacity -> done
+```
+
+So the instance is owned by an Auto Scaling group instead. It is not there to scale anything — `min=0`, `max=1`, `desired=1` — it is there to *search*:
+
+```
+                    desired = 1
+                         |
+                 MixedInstancesPolicy
+                         |
+          +--------------+--------------+
+     instance types                    AZs
+          |                             |
+    g6e.12xlarge  --+           eu-central-1a
+          |          +- prioritized     1b
+    g7e.12xlarge  --+                   1c
+          |                             |
+          +--------------+--------------+
+                         v
+                  first pool that
+                   has capacity
+```
+
+`on_demand_allocation_strategy = "prioritized"` walks the instance-type overrides in declared order and moves to the next when a pool cannot satisfy the launch. The AZ list comes from `aws_ec2_instance_type_offerings`, so the group is only ever pointed at zones that genuinely offer one of the requested types.
+
+Three consequences worth knowing:
+
+- **`terraform apply` does not wait for capacity** (`wait_for_capacity_timeout = "0"`). It returns as soon as the group exists, and the group keeps retrying in the background. Failing the apply would only destroy the thing doing the retrying. The workflow prints the scaling activities at the end of the job; locally, use the `capacity_hunt_command` output.
+- **There is no `instance_id` output any more** — the instance does not exist at plan time. Use the `instance_id_command` output to resolve it.
+- **The group runs with `HealthCheck`, `ReplaceUnhealthy` and `AZRebalance` suspended.** This is load-bearing, not incidental — see below.
+
 ### Cost guardrails
 
-A g5.xlarge costs ~$1.20/h, so forgetting it running overnight is a $20 mistake. A **g6e.12xlarge costs ~$13.12/h in eu-central-1** — booting at 09:00 and relying only on a 01:00 nightly cron burns **~$210 in a single day**. So three independent layers stop the VM:
+A g5.xlarge costs ~$1.20/h, so forgetting it running overnight is a $20 mistake. A **g6e.12xlarge costs ~$13.12/h in eu-central-1** — booting at 09:00 and relying only on a 01:00 nightly schedule burns **~$210 in a single day**. So three independent layers shut the VM down:
 
-| Layer | Where | Default | Tune with |
-|---|---|---|---|
-| **Hard TTL** | systemd timer, `OnBootSec` | stop **4 h** after boot | `auto_stop_hours` workflow input (`0` disables) |
-| **Idle stop** | systemd timer, probed every 5 min | stop after **30 min** with GPU < 5 % and no connections on the service ports | `idle_stop_minutes` Terraform var |
-| **Nightly cron** | EventBridge Scheduler | **01:00 Europe/Amsterdam** | `infra/operations.tf` |
+| Layer | Where | Action | Default | Tune with |
+|---|---|---|---|---|
+| **Hard TTL** | systemd timer, `OnBootSec` | **stop** | stop **4 h** after boot | `auto_stop_hours` workflow input (`0` disables) |
+| **Idle stop** | systemd timer, probed every 5 min | **stop** | stop after **30 min** with GPU < 5 % and no connections on the service ports | `idle_stop_minutes` Terraform var |
+| **Nightly** | EventBridge Scheduler → ASG `desired=0` | **terminate** | **01:00 Europe/Amsterdam** | `infra/operations.tf` |
 
-The in-VM layers call `systemctl poweroff`. Terraform pins `instance_initiated_shutdown_behavior = "stop"`, so an OS shutdown **stops** the instance rather than terminating it — the root volume and any cached models survive untouched, and no extra IAM permissions are needed.
+The first two layers call `systemctl poweroff`. The launch template pins `instance_initiated_shutdown_behavior = "stop"`, so an OS shutdown **stops** the instance rather than terminating it — the root volume and any cached models survive untouched, and no extra IAM permissions are needed.
+
+**That only works because the ASG has `HealthCheck` and `ReplaceUnhealthy` suspended.** A default Auto Scaling group fails a stopped member's EC2 health check, terminates it, and launches a replacement — which would turn the cheapest cost guardrail into a $13/h billing loop. `AZRebalance` is suspended for a related reason: with subnets in several zones the group would otherwise be free to terminate a healthy instance just to even out the distribution of a one-instance group. If you ever un-suspend those processes, the two in-VM layers must be rewritten to call `aws autoscaling set-desired-capacity --desired-capacity 0` instead of `poweroff`.
+
+The **nightly layer is different in kind: it terminates.** That is not a preference — EventBridge can only call `StopInstances` with an explicit instance ID, and under an ASG there is no instance ID at plan time. `SetDesiredCapacity` works on the group name, which Terraform does know. The trade is a model re-download the next morning (~30–45 min of instance time for H3) instead of ~$210 of runtime.
 
 The idle probe deliberately treats these as *busy*, so it never stops a machine that is still working:
 
@@ -100,7 +140,24 @@ sudo nano /etc/llm-lab/autostop.env    # retune without redeploying
 
 ### "Autostop" is not "no-cost"
 
-Every layer **stops** the instance; none destroy it. While stopped you still pay for EBS (a 500 GiB gp3 root volume for H3 is ~$50/month on its own) and the Elastic IP. Run `destroy` when you want zero ongoing charges — but note that destroying an H3 deployment throws away the 144 GB checkpoint, which then has to be re-downloaded next time.
+The first two layers **stop** the instance; only the nightly one destroys it. While stopped you still pay for EBS (a 500 GiB gp3 root volume for H3 is ~$50/month on its own) and the Elastic IP. Run `destroy` when you want zero ongoing charges — but note that destroying an H3 deployment throws away the 144 GB checkpoint, which then has to be re-downloaded next time.
+
+Restarting after a TTL/idle stop keeps the checkpoint:
+
+```bash
+ASG=$(terraform -chdir=infra output -raw asg_name)
+ID=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
+       --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)
+aws ec2 start-instances --instance-ids "$ID"
+```
+
+Scaling the group to zero does not — it terminates:
+
+```bash
+aws autoscaling set-desired-capacity --auto-scaling-group-name "$ASG" --desired-capacity 0
+```
+
+The durable fix is a snapshot-backed `/opt/models` volume so the weights outlive the instance. Not implemented yet.
 
 ---
 
@@ -108,14 +165,17 @@ Every layer **stops** the instance; none destroy it. While stopped you still pay
 
 | Region | Location | Notes |
 |---|---|---|
-| `eu-central-1` | Frankfurt, DE | Default |
-| `eu-west-1` | Ireland, IE | Cheapest EU option for g5 |
-| `eu-north-1` | Stockholm, SE | Good EU alternative |
+| `eu-central-1` | Frankfurt, DE | Default. H3-capable |
+| `eu-west-1` | Ireland, IE | Cheapest EU option for g5. **No G6e/G7e** |
+| `eu-north-1` | Stockholm, SE | Good EU alternative. H3-capable |
+| `eu-south-2` | Spain, ES | H3-capable |
 | `us-east-2` | Ohio, US | Typically lowest overall price |
 
 > `eu-west-1` is typically 10–15 % cheaper than `eu-central-1` for g5 on-demand. `us-east-2` is usually cheapest.
 
-**For the `minimax-h3` workload the choice is narrower.** `g6e.12xlarge` is not offered in `eu-west-1` at all, and while it exists in `us-east-2` the *Running On-Demand G and VT instances* quota there is commonly 0 on accounts that have never requested it. Terraform therefore restricts `enable_h3` to `eu-central-1` and `eu-north-1`.
+**For the `minimax-h3` workload the choice is narrower.** G6e/G7e `.12xlarge` are offered in three EU regions — Frankfurt, Stockholm and Spain — and while `g6e.12xlarge` exists in `us-east-2`, the *Running On-Demand G and VT instances* quota there is commonly 0 on accounts that have never requested it. Terraform therefore restricts `enable_h3` to `eu-central-1`, `eu-north-1` and `eu-south-2`.
+
+An Auto Scaling group is a **regional** resource: it waterfalls across instance types and AZs, but not across Frankfurt → Stockholm → Spain. Covering all three means three deployments — the Terraform state key is already scoped per region — and choosing which one to bring to `desired=1`.
 
 ---
 
@@ -137,13 +197,18 @@ Every layer **stops** the instance; none destroy it. While stopped you still pay
 | `g5.12xlarge` | 48 | 192 GiB | 1×3800 GB | 40 Gbps |
 | `g5.24xlarge` | 96 | 384 GiB | 1×3800 GB | 50 Gbps |
 
-### Video generation — 4× NVIDIA L40S, 192 GB total GPU RAM
+### Video generation — H3-capable shapes
 
-| Instance | vCPU | RAM | NVMe | Network | eu-central-1 on-demand |
-|---|---|---|---|---|---|
-| `g6e.12xlarge` | 48 | 384 GiB | 3800 GB | 100 Gbps | **~$13.12/h** |
+Required by, and only usable with, the `minimax-h3` workload. The Auto Scaling group treats these two as interchangeable and takes whichever has capacity.
 
-Required by, and only usable with, the `minimax-h3` workload. Note what those numbers mean in practice: 4 × 46 GB of usable VRAM is **not** enough to hold H3 resident (published datacenter recipes peak at 50–94 GB per GPU), so layerwise offload to host RAM is mandatory — which makes the 384 GiB of host RAM the binding constraint, not the VRAM. L40S also has **no NVLink**, so tensor/sequence parallelism crosses PCIe.
+| Instance | GPUs | Total VRAM | vCPU | RAM | Network | eu-central-1 on-demand |
+|---|---|---|---|---|---|---|
+| `g6e.12xlarge` | 4× NVIDIA L40S 48 GB | 192 GB | 48 | 384 GiB | 100 Gbps | **~$13.12/h** |
+| `g7e.12xlarge` | 2× NVIDIA RTX PRO 6000 Blackwell 96 GB | 192 GB | — | 512 GiB | — | — |
+
+Note what those numbers mean in practice: 192 GB of total VRAM is **not** enough to hold H3 resident (published datacenter recipes peak at 50–94 GB per GPU), so layerwise offload to host RAM is mandatory on either shape — which makes host RAM the binding constraint, not VRAM. L40S also has **no NVLink**, so tensor/sequence parallelism crosses PCIe.
+
+The two shapes need different parallelism flags (4 GPUs wants `--ulysses-degree 2`, 2 GPUs wants `1`), so `provision_h3_stack.sh` derives them from `nvidia-smi` at boot rather than from Terraform — the instance type is not known until the ASG picks one. **`g7e.12xlarge` is untested with H3 here**; it is in the waterfall because 96 GB per card removes a lot of parallelism complexity, not because it has been measured.
 
 ---
 
@@ -151,16 +216,16 @@ Required by, and only usable with, the `minimax-h3` workload. Note what those nu
 
 ```
 infra/
-  network.tf        VPC, subnet, internet gateway, routing
-  compute.tf        Security group, EC2 instance, Elastic IP
+  network.tf        VPC, one subnet per capable AZ, internet gateway, routing
+  compute.tf        Security group, launch template, capacity-hunting ASG, Elastic IP
   provisioning.tf   S3 scripts bucket, IAM role/instance profile
-  operations.tf     Nightly autostop EventBridge schedule
+  operations.tf     Nightly scale-to-zero EventBridge schedule
   variables.tf      All tunable inputs
-  locals.tf         Computed values and shared tags
-  outputs.tf        Instance ID, public IP, portal + app URLs, SSH command
+  locals.tf         Instance-type waterfall, computed values, shared tags
+  outputs.tf        ASG name, public IP, portal + app URLs, lifecycle commands
 
 scripts/
-  user-data.sh                  Cloud-init entry point (downloads scripts from S3)
+  user-data.sh                  Cloud-init entry point (claims the EIP, downloads scripts from S3)
   bootstrap_all.sh              Orchestrator: gates every stack on an ENABLE_* flag
   lib_docker_gpu.sh             Shared Docker + NVIDIA Container Toolkit setup (sourced, no side effects)
   provision_monitoring_stack.sh Netdata agent + real-time GPU/CPU/RAM/disk dashboard (port 19999)
@@ -182,7 +247,7 @@ scripts/
 
 ## Prerequisites
 
-1. **AWS credentials** with permissions for EC2, VPC, IAM, S3, EventBridge Scheduler.
+1. **AWS credentials** with permissions for EC2, VPC, Auto Scaling, IAM, S3, EventBridge Scheduler.
 2. **S3 bucket** for Terraform remote state (one per AWS account is enough). State is keyed per deploy region (`llm-gpu/<region>/terraform.tfstate`) so each region is independent and never collides. The bucket itself lives in a single region regardless of where you deploy the VM — set `TF_STATE_REGION` if it is not in `eu-central-1`.
 3. **Your public IPv4 address** for the `ipv4_allowed` parameter.
 4. **EC2 key pair** *(optional)* — only needed for SSH access. Leave `key_pair_name` blank if you don't need it.
@@ -207,9 +272,9 @@ Go to **Actions → Manage GPU VM → Run workflow** and fill in:
 | Input | Description | Default |
 |---|---|---|
 | `action` | `apply` to create, `destroy` to tear down | `apply` |
-| `instance_type` | Instance size (see tables above). `g6e.12xlarge` is required by `minimax-h3` and rejected for anything else | `g5.xlarge` |
+| `instance_type` | **Preferred** instance size (see tables above). The ASG falls back to the other H3-capable type if this pool is empty | `g5.xlarge` |
 | `aws_region` | Target region (see table above) | `eu-central-1` |
-| `availability_zone` | Optional AZ override for `InsufficientInstanceCapacity` | *(blank)* |
+| `availability_zone` | Optional AZ **pin**. Leave blank so the ASG can search every capable zone | *(blank)* |
 | `key_pair_name` | EC2 key pair name for SSH — leave blank to skip | *(blank)* |
 | `ipv4_allowed` | Your public IPv4 (e.g. `203.0.113.25`) | *(required)* |
 | `workload` | `llm-lab`, `speech-lab`, or `minimax-h3` | `llm-lab` |
@@ -217,9 +282,11 @@ Go to **Actions → Manage GPU VM → Run workflow** and fill in:
 | `asr` | `none` / `whisper-large-v3` / `granite-8b` — ignored for `minimax-h3` | `none` |
 | `auto_stop_hours` | Hard TTL from boot; `0` disables it | `4` |
 
-> `workflow_dispatch` caps a workflow at **10 inputs** and this list uses all 10. That is why `workload` is a single picker rather than separate `enable_llm` / `enable_tts` booleans — the stacks were never freely combinable anyway (they compete for the same VRAM, and H3 is exclusive by construction). Root volume size and throughput are derived from `workload`; override them with `TF_VAR_root_volume_size` / `TF_VAR_root_volume_throughput`.
+> `workflow_dispatch` caps a workflow at **10 inputs** and this list uses all 10. That is why `workload` is a single picker rather than separate `enable_llm` / `enable_tts` booleans — the stacks were never freely combinable anyway (they compete for the same VRAM, and H3 is exclusive by construction). Root volume size and throughput are derived from `workload`; override them with `TF_VAR_root_volume_size` / `TF_VAR_root_volume_throughput`. The instance-type waterfall is derived too; override it with `TF_VAR_instance_type_fallbacks`.
 
-Terraform outputs (Elastic IP, app URLs, the H3 curl example, and the active autostop summary) are printed at the end of the job log.
+Terraform outputs (Elastic IP, app URLs, the instance-type waterfall, the H3 curl example, and the active autostop summary) are printed at the end of the job, followed by the ASG's scaling activities — that last table is where you find out whether a GPU was actually found, and why not.
+
+Note that **apply does not wait for capacity**. If the group is still hunting when the job ends, re-run the report or use the `capacity_hunt_command` output; there is nothing to re-apply.
 
 ---
 
@@ -252,6 +319,14 @@ terraform -chdir=infra apply -auto-approve \
 
 Get any of that wrong and Terraform fails during `plan` with an explanation, rather than 20 minutes into a $13/h boot.
 
+`apply` returns as soon as the Auto Scaling group exists — it does not block waiting for a GPU. Watch the hunt with:
+
+```bash
+eval "$(terraform -chdir=infra output -raw capacity_hunt_command)"
+```
+
+`Successful` means a GPU was found; repeated `Failed` rows with `InsufficientInstanceCapacity` mean every pool in the waterfall is currently empty and the group is still retrying. Nothing needs re-applying either way.
+
 ---
 
 ## Provisioning pipeline
@@ -260,6 +335,7 @@ Once Terraform creates the instance, AWS runs `scripts/user-data.sh` as root via
 
 ```
 cloud-init (user-data.sh)
+  └── associates the Elastic IP with itself (the ASG picked the AZ, not Terraform)
   └── downloads scripts from S3 via IAM instance role
   └── bootstrap_all.sh
         ├── [1/7] provision_monitoring_stack.sh   (ENABLE_MONITORING)
@@ -285,7 +361,8 @@ cloud-init (user-data.sh)
         │     ├── pre-downloads vibevoice/VibeVoice-1.5B (up to 4 speakers)
         │     └── registers vibevoice-tts.service (systemd, port 7861)
         ├── [5/7] provision_h3_stack.sh + provision_h3_ui_stack.sh   (ENABLE_H3, exclusive)
-        │     ├── preflight: 4 GPUs, >=350 GiB RAM, >=220 GB free — fail fast, this box is expensive
+        │     ├── preflight: 2 or 4 GPUs, >=350 GiB RAM, >=220 GB free — fail fast, this box is expensive
+        │     ├── derives the parallelism flags from the GPU count the ASG actually landed on
         │     ├── installs llm-lab-nvme-scratch.service (NVMe scratch + 256 GiB swap, re-run every boot)
         │     ├── downloads only the FL2VA partition (~144 GB) into /opt/models on EBS
         │     ├── pulls the PINNED SGLang image (never :latest)
@@ -439,6 +516,6 @@ MiniMax-H3 is released under the **MiniMax H3 Community License Agreement**, not
 - `ipv4_allowed` is converted to a `/32` CIDR internally — all inbound ports are restricted to your single IP.
 - IMDSv2 is enforced on the instance (`http_tokens = "required"`).
 - The scripts S3 bucket is private, server-side encrypted (AES-256), and has all public access blocked.
-- The instance IAM role grants **read-only** access to the scripts bucket only.
+- The instance IAM role grants **read-only** access to the scripts bucket, plus `ec2:AssociateAddress` scoped to this deployment's Elastic IP — it cannot scale, stop or terminate anything.
 - The workflow uses long-lived AWS access keys; consider migrating to **GitHub OIDC** for keyless authentication.
 

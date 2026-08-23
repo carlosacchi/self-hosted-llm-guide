@@ -15,14 +15,19 @@ set -euo pipefail
 #   GET  /v1/videos/{id}/content    -> the MP4 bytes
 # provision_h3_ui_stack.sh wraps that loop in a Gradio UI on port 7865.
 #
-# TARGET HARDWARE: g6e.12xlarge (4x NVIDIA L40S 48 GB, 48 vCPU, 384 GiB RAM,
-# 3.8 TB local NVMe). Two consequences drive everything below:
+# TARGET HARDWARE: an H3-capable GPU box, chosen at launch by the Auto Scaling
+# group from whichever pool has capacity:
 #
-#   1. 46 GB of usable VRAM per card is NOT enough to hold H3 resident -- the
-#      published datacenter recipes peak at 50-94 GB per GPU. Layerwise offload
-#      to host RAM is mandatory (--performance-mode memory).
+#   g6e.12xlarge   4x NVIDIA L40S 48 GB          48 vCPU, 384 GiB RAM, 3.8 TB NVMe
+#   g7e.12xlarge   2x NVIDIA RTX PRO 6000 96 GB  512 GiB RAM
+#
+# Two consequences drive everything below:
+#
+#   1. 192 GB of total VRAM is NOT enough to hold H3 resident -- the published
+#      datacenter recipes peak at 50-94 GB per GPU. Layerwise offload to host
+#      RAM is mandatory (--performance-mode memory) on either shape.
 #   2. That makes HOST RAM the binding constraint, not VRAM. The reference
-#      offload recipe (2x RTX 5090) needs ~377 GiB of host RAM; this box has
+#      offload recipe (2x RTX 5090) needs ~377 GiB of host RAM; g6e.12xlarge has
 #      384 GiB, a ~2% margin. We add a large NVMe-backed swapfile as the
 #      cushion, because swapping is slow but an OOM kill costs a whole run.
 #
@@ -66,7 +71,19 @@ SWAP_GIB="${SWAP_GIB:-256}"
 # CUDA layers and room for generated MP4s.
 MIN_FREE_GB="${MIN_FREE_GB:-220}"
 MIN_RAM_GB="${MIN_RAM_GB:-350}"
-EXPECTED_GPUS="${EXPECTED_GPUS:-4}"
+
+# Which GPU topologies this script knows how to configure. The Auto Scaling
+# group picks whichever H3-capable shape has capacity, so the count is not known
+# until boot:
+#
+#   4 GPUs  g6e.12xlarge   4x L40S 48 GB          384 GiB RAM
+#   2 GPUs  g7e.12xlarge   2x RTX PRO 6000 96 GB  512 GiB RAM
+#
+# Both total 192 GB of VRAM, neither can hold H3 resident, and the parallelism
+# flags differ. DETECTED_GPUS is filled in by preflight and consumed when the
+# systemd unit is written.
+SUPPORTED_GPU_COUNTS="${SUPPORTED_GPU_COUNTS:-2 4}"
+DETECTED_GPUS=0
 
 log() {
   echo -e "[provision_h3_stack] $*"
@@ -101,20 +118,22 @@ preflight() {
 
   local gpu_count
   gpu_count="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
+  DETECTED_GPUS="${gpu_count}"
   log "  GPUs detected: ${gpu_count}"
   nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader | while read -r line; do
     log "    ${line}"
   done
 
-  if [[ "${gpu_count}" -ne "${EXPECTED_GPUS}" ]]; then
+  if ! grep -qw "${gpu_count}" <<<"${SUPPORTED_GPU_COUNTS}"; then
     if [[ "${H3_ALLOW_ANY_GPU:-false}" == "true" ]]; then
-      log "  WARNING: expected ${EXPECTED_GPUS} GPUs, found ${gpu_count}. Continuing because"
-      log "           H3_ALLOW_ANY_GPU=true. You will need to retune the parallelism flags."
+      log "  WARNING: ${gpu_count} GPUs is not a topology this script has a profile for"
+      log "           (known: ${SUPPORTED_GPU_COUNTS}). Continuing because H3_ALLOW_ANY_GPU=true."
+      log "           Set H3_NUM_GPUS/H3_TP_SIZE/H3_ULYSSES yourself."
     else
-      log "FATAL: expected ${EXPECTED_GPUS} GPUs (g6e.12xlarge), found ${gpu_count}."
-      log "       The launch flags below assume a 4-GPU topology. Set"
-      log "       H3_ALLOW_ANY_GPU=true and adjust H3_NUM_GPUS/H3_TP_SIZE/H3_ULYSSES"
-      log "       if you really mean to run on a different layout."
+      log "FATAL: found ${gpu_count} GPUs; known topologies are ${SUPPORTED_GPU_COUNTS}"
+      log "       (4 = g6e.12xlarge, 2 = g7e.12xlarge). The launch flags depend on"
+      log "       this. Set H3_ALLOW_ANY_GPU=true and adjust"
+      log "       H3_NUM_GPUS/H3_TP_SIZE/H3_ULYSSES if you really mean it."
       exit 1
     fi
   fi
@@ -337,9 +356,13 @@ install_systemd_service() {
 
   # Parallelism / offload knobs, overridable without editing the unit.
   #
-  # There is no published L40S profile: the SGLang cookbook covers H200, H100,
-  # B200, RTX 5090 and RTX 4090. These values start from the 4-GPU datacenter
-  # recipe and add the offload flags from the verified memory-constrained one.
+  # There is no published L40S or RTX PRO 6000 profile: the SGLang cookbook
+  # covers H200, H100, B200, RTX 5090 and RTX 4090. These values start from the
+  # 4-GPU datacenter recipe and add the offload flags from the verified
+  # memory-constrained one. Ulysses sequence parallelism is only worth paying
+  # for when there are more GPUs than the tensor-parallel degree, so the 2-GPU
+  # shape drops it to 1.
+  #
   # If the server OOMs during weight loading, walk DOWN this ladder in order:
   #
   #   1. H3_RESIDENT_LAYERS=0        keep no DiT layers resident (slower, leanest)
@@ -349,10 +372,15 @@ install_systemd_service() {
   #
   # Whatever ends up working, write it into the Terraform defaults so the next
   # deploy does not re-discover it at $13/hour.
+  local default_ulysses=1
+  if [[ "${DETECTED_GPUS}" -ge 4 ]]; then
+    default_ulysses=2
+  fi
+
   cat > /etc/llm-lab-h3.env <<EOF
-H3_NUM_GPUS=${H3_NUM_GPUS:-4}
+H3_NUM_GPUS=${H3_NUM_GPUS:-${DETECTED_GPUS}}
 H3_TP_SIZE=${H3_TP_SIZE:-2}
-H3_ULYSSES=${H3_ULYSSES:-2}
+H3_ULYSSES=${H3_ULYSSES:-${default_ulysses}}
 H3_PERFORMANCE_MODE=${H3_PERFORMANCE_MODE:-memory}
 H3_RESIDENT_LAYERS=${H3_RESIDENT_LAYERS:-20}
 H3_OFFLOAD_PREFETCH=${H3_OFFLOAD_PREFETCH:-1}

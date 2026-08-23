@@ -4,20 +4,43 @@ variable "aws_region" {
   default     = "eu-central-1"
 
   validation {
-    condition     = contains(["eu-central-1", "eu-west-1", "eu-north-1", "us-east-2"], var.aws_region)
-    error_message = "Supported regions: eu-central-1 (Frankfurt), eu-west-1 (Ireland), eu-north-1 (Stockholm), us-east-2 (Ohio)."
+    condition     = contains(["eu-central-1", "eu-west-1", "eu-north-1", "eu-south-2", "us-east-2"], var.aws_region)
+    error_message = "Supported regions: eu-central-1 (Frankfurt), eu-west-1 (Ireland), eu-north-1 (Stockholm), eu-south-2 (Spain), us-east-2 (Ohio)."
   }
 }
 
 variable "instance_type" {
-  description = "GPU instance size to provision"
+  description = "Preferred GPU instance size. This is the FIRST entry in the Auto Scaling group's instance-type waterfall, not the only one it may launch (see instance_type_fallbacks)."
   type        = string
   default     = "g5.xlarge"
 
   validation {
-    condition     = contains(["g5.xlarge", "g5.2xlarge", "g5.4xlarge", "g5.8xlarge", "g5.12xlarge", "g5.24xlarge", "g6e.12xlarge"], var.instance_type)
-    error_message = "Supported instance types: g5.xlarge, g5.2xlarge, g5.4xlarge, g5.8xlarge (single A10G) | g5.12xlarge, g5.24xlarge (multi A10G) | g6e.12xlarge (4x L40S 48 GB, required by the MiniMax-H3 stack)."
+    condition     = contains(["g5.xlarge", "g5.2xlarge", "g5.4xlarge", "g5.8xlarge", "g5.12xlarge", "g5.24xlarge", "g6e.12xlarge", "g7e.12xlarge"], var.instance_type)
+    error_message = "Supported instance types: g5.xlarge, g5.2xlarge, g5.4xlarge, g5.8xlarge (single A10G) | g5.12xlarge, g5.24xlarge (multi A10G) | g6e.12xlarge (4x L40S 48 GB), g7e.12xlarge (2x RTX PRO 6000 96 GB) -- the two H3-capable shapes."
   }
+}
+
+variable "instance_type_fallbacks" {
+  description = "Ordered fallback instance types for the Auto Scaling group to try when the preferred one has no capacity. Leave empty to use the built-in default: the other H3-capable type when enable_h3 is set, nothing otherwise. Types the active region does not offer are dropped automatically."
+  type        = list(string)
+  default     = []
+}
+
+variable "desired_capacity" {
+  description = "How many GPU instances the Auto Scaling group should be running. 1 to work, 0 to scale the lab to zero without destroying the VPC/IAM/S3 scaffolding. The nightly schedule sets this to 0 in AWS; the next `terraform apply` puts it back."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.desired_capacity >= 0 && var.desired_capacity <= 1
+    error_message = "desired_capacity must be 0 or 1. This is a single-box lab, not a fleet."
+  }
+}
+
+variable "health_check_grace_period" {
+  description = "Seconds before the ASG starts health-checking a new instance. Largely academic here because HealthCheck is a suspended process, but a low value would be actively wrong: H3 provisioning takes 30-45 minutes."
+  type        = number
+  default     = 900
 }
 
 variable "key_pair_name" {
@@ -97,7 +120,7 @@ variable "asr_model" {
 # exclusive with every other GPU stack (enforced by preconditions in compute.tf).
 
 variable "enable_h3" {
-  description = "Provision the MiniMax-H3 stack: SGLang-Diffusion video+audio generation (REST 30010, Gradio UI 7865). Requires g6e.12xlarge and excludes every other GPU stack."
+  description = "Provision the MiniMax-H3 stack: SGLang-Diffusion video+audio generation (REST 30010, Gradio UI 7865). Requires an H3-capable instance type (g6e.12xlarge / g7e.12xlarge) and excludes every other GPU stack."
   type        = bool
   default     = false
 }
@@ -177,25 +200,19 @@ variable "ipv4_allowed" {
 }
 
 variable "vpc_cidr" {
-  description = "CIDR range for the dedicated VPC"
+  description = "CIDR range for the dedicated VPC. One /24 is carved out of it per candidate availability zone."
   type        = string
   default     = "10.42.0.0/16"
 }
 
-variable "public_subnet_cidr" {
-  description = "CIDR range for the public subnet"
-  type        = string
-  default     = "10.42.0.0/24"
-}
-
 variable "availability_zone" {
-  description = "Availability zone for the public subnet. Leave empty to auto-select the first AZ in the active region."
+  description = "Pin the Auto Scaling group to a single AZ. Leave empty (recommended) to let it search every AZ that offers a type in the waterfall -- narrowing the search is the behaviour that produced InsufficientInstanceCapacity in the first place."
   type        = string
   default     = ""
 }
 
 variable "aws_max_retries" {
-  description = "Max AWS API retry attempts. Kept low so an InsufficientInstanceCapacity error fails in ~1-2 min instead of retrying ~25 times over ~50 min."
+  description = "Max AWS API retry attempts. Capacity hunting is now the Auto Scaling group's job, so this only governs ordinary control-plane calls."
   type        = number
   default     = 3
 }

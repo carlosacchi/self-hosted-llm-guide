@@ -10,8 +10,8 @@
 # Pulling from S3 instead of embedding the scripts keeps user-data well under
 # the 16 KB EC2 limit and supports arbitrarily large scripts.
 #
-# The template variables (scripts_bucket, aws_region) are filled in by
-# Terraform's templatefile() (see infra/compute.tf).
+# The template variables (scripts_bucket, aws_region, eip_allocation_id) are
+# filled in by Terraform's templatefile() (see infra/compute.tf).
 #
 set -euo pipefail
 
@@ -22,6 +22,29 @@ echo "========================================"
 echo "LLM Lab cloud-init bootstrap"
 echo "Date: $(date)"
 echo "========================================"
+
+# --- Claim the Elastic IP ----------------------------------------------------
+# The Auto Scaling group picks the instance and the AZ, so Terraform cannot bind
+# the address at plan time. Done FIRST, before anything else touches the
+# network: associating an EIP swaps the instance's public address and resets any
+# connection already open through the old one.
+imds() {
+  local token
+  token="$(curl -sS -m 5 -X PUT http://169.254.169.254/latest/api/token \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')"
+  curl -sS -m 5 -H "X-aws-ec2-metadata-token: $token" \
+    "http://169.254.169.254/latest/meta-data/$1"
+}
+
+INSTANCE_ID="$(imds instance-id)"
+echo "-> Associating Elastic IP ${eip_allocation_id} with $INSTANCE_ID"
+aws ec2 associate-address \
+  --region "${aws_region}" \
+  --allocation-id "${eip_allocation_id}" \
+  --instance-id "$INSTANCE_ID" \
+  --allow-reassociation
+# Let the new address settle before the first outbound transfer.
+sleep 10
 
 PROVISION_DIR="/opt/llm-lab/provisioning"
 mkdir -p "$PROVISION_DIR"

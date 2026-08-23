@@ -11,7 +11,7 @@ on:
           - destroy
         default: apply
       instance_type:
-        description: "Instance size. g5.* = A10G 24 GB (~$1.2-$7/h). g6e.12xlarge = 4x L40S 48 GB (~$13.1/h in eu-central-1) and is REQUIRED by, and only by, the minimax-h3 workload."
+        description: "PREFERRED instance size -- the ASG falls back to the other H3-capable type if this pool is empty. g5.* = A10G 24 GB (~$1.2-$7/h). g6e.12xlarge (4x L40S) and g7e.12xlarge (2x RTX PRO 6000) are the two shapes the minimax-h3 workload accepts."
         type: choice
         options:
           - g5.xlarge
@@ -21,18 +21,20 @@ on:
           - g5.12xlarge
           - g5.24xlarge
           - g6e.12xlarge
+          - g7e.12xlarge
         default: g5.xlarge
       aws_region:
-        description: "AWS region to deploy into (eu-west-1/Ireland is cheapest EU option)"
+        description: "AWS region to deploy into (eu-west-1/Ireland is cheapest EU option; minimax-h3 needs eu-central-1, eu-north-1 or eu-south-2)"
         type: choice
         options:
           - eu-central-1
           - eu-west-1
           - eu-north-1
+          - eu-south-2
           - us-east-2
         default: eu-central-1
       availability_zone:
-        description: "Optional AZ override, e.g. eu-west-1b. Leave empty to auto-pick the first g5-capable AZ. Set a specific AZ if you hit InsufficientInstanceCapacity."
+        description: "Optional AZ pin, e.g. eu-west-1b. Leave EMPTY (recommended): the ASG searches every capable AZ, which is the whole point. Pin it only to reproduce a known-good placement."
         required: false
         default: ""
       key_pair_name:
@@ -68,7 +70,7 @@ on:
           - granite-8b
         default: none
       auto_stop_hours:
-        description: "Hard time-to-live: stop the VM this many hours after boot, whatever happens. '0' disables it. Idle-stop (30 min) and the 01:00 nightly cron apply on top."
+        description: "Hard time-to-live: stop the VM this many hours after boot, whatever happens. '0' disables it. Idle-stop (30 min) and the 01:00 nightly scale-to-zero apply on top."
         type: choice
         options:
           - "2"
@@ -173,6 +175,25 @@ jobs:
         if: ${{ inputs.action == 'apply' }}
         working-directory: infra
         run: terraform apply -input=false -auto-approve
+
+      # `apply` does not wait for capacity: the ASG keeps hunting across every
+      # capable instance type and AZ in the background. This is the only place
+      # that reports whether it actually found a GPU, and why not.
+      - name: Report capacity hunt
+        if: ${{ inputs.action == 'apply' }}
+        working-directory: infra
+        run: |
+          ASG="$(terraform output -raw asg_name)"
+          echo "Auto Scaling group: $ASG"
+          aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG" \
+            --query 'AutoScalingGroups[0].Instances[].[InstanceId,InstanceType,AvailabilityZone,LifecycleState]' \
+            --output table
+          aws autoscaling describe-scaling-activities \
+            --auto-scaling-group-name "$ASG" \
+            --max-items 10 \
+            --query 'Activities[].[StartTime,StatusCode,StatusMessage]' \
+            --output table
 
       - name: Terraform Destroy
         if: ${{ inputs.action == 'destroy' }}

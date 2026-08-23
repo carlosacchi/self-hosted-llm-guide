@@ -20,14 +20,15 @@ data "aws_availability_zones" "available" {
   state = "available"
 }
 
-# Availability zones in the active region that actually offer the requested
-# instance type (g5 GPU instances are not available in every AZ, e.g.
-# eu-north-1a does not offer g5.xlarge). We intersect this with the region's
-# available AZs and pick the first valid one.
+# Which of the requested instance types are offered where. GPU instances are not
+# available in every AZ (eu-north-1a does not offer g5.xlarge, g7e is not
+# everywhere g6e is), so this drives BOTH the subnet fan-out and the ASG's
+# instance-type overrides -- there is no point offering the group a type the
+# region has never heard of.
 data "aws_ec2_instance_type_offerings" "gpu" {
   filter {
     name   = "instance-type"
-    values = [var.instance_type]
+    values = local.requested_instance_types
   }
 
   filter {
@@ -39,30 +40,47 @@ data "aws_ec2_instance_type_offerings" "gpu" {
 }
 
 locals {
-  # AZs (sorted for determinism) that support the instance type.
-  supported_azs = sort(data.aws_ec2_instance_type_offerings.gpu.locations)
+  # instance_types[i] is offered in locations[i] -- the two attributes are
+  # parallel lists, not independent sets.
+  az_offerings = [
+    for i, t in data.aws_ec2_instance_type_offerings.gpu.instance_types : {
+      instance_type = t
+      az            = data.aws_ec2_instance_type_offerings.gpu.locations[i]
+    }
+  ]
 
-  # Explicit override wins; otherwise use the first AZ that supports the type.
-  # try() keeps an unsupported region from failing here with a bare "Invalid
-  # index"; the subnet precondition below explains what actually went wrong.
-  selected_az = var.availability_zone != "" ? var.availability_zone : try(local.supported_azs[0], "")
+  # Waterfall, filtered to what this region actually offers, order preserved.
+  instance_type_waterfall = [
+    for t in local.requested_instance_types : t
+    if contains(data.aws_ec2_instance_type_offerings.gpu.instance_types, t)
+  ]
+
+  primary_instance_type = try(local.instance_type_waterfall[0], var.instance_type)
+
+  # Every AZ that can serve at least one type in the waterfall. Sorted for
+  # deterministic subnet CIDR assignment.
+  candidate_azs = sort(distinct([for o in local.az_offerings : o.az]))
+
+  # An explicit override narrows the hunt to one AZ, which is usually the wrong
+  # thing to do now that the ASG can search -- kept for reproducing a known-good
+  # placement.
+  deploy_azs = var.availability_zone != "" ? [
+    for az in local.candidate_azs : az if az == var.availability_zone
+  ] : local.candidate_azs
 }
 
+# One /24 per candidate AZ. The ASG needs a subnet in every zone it is allowed
+# to search; a single-subnet group can only ever fail in one place.
 resource "aws_subnet" "public" {
+  for_each = { for idx, az in local.deploy_azs : az => idx }
+
   vpc_id                  = aws_vpc.llm.id
-  cidr_block              = var.public_subnet_cidr
-  availability_zone       = local.selected_az
+  cidr_block              = cidrsubnet(var.vpc_cidr, 8, each.value)
+  availability_zone       = each.key
   map_public_ip_on_launch = true
 
-  lifecycle {
-    precondition {
-      condition     = local.selected_az != ""
-      error_message = "Instance type ${var.instance_type} is not offered in any availability zone of ${var.aws_region}. Pick another region: g6e.12xlarge, for example, exists in eu-central-1 and eu-north-1 but not in eu-west-1."
-    }
-  }
-
   tags = merge({
-    Name = "llm-gpu-public"
+    Name = "llm-gpu-public-${each.key}"
   }, local.lab_tags)
 }
 
@@ -80,6 +98,8 @@ resource "aws_route_table" "public" {
 }
 
 resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
+  for_each = aws_subnet.public
+
+  subnet_id      = each.value.id
   route_table_id = aws_route_table.public.id
 }

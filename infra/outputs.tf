@@ -1,10 +1,42 @@
-output "instance_id" {
-  description = "ID of the GPU instance"
-  value       = aws_instance.llm_gpu.id
+output "asg_name" {
+  description = "Auto Scaling group that hunts for GPU capacity and owns the instance"
+  value       = aws_autoscaling_group.llm_gpu.name
+}
+
+output "instance_type_waterfall" {
+  description = "Ordered instance types the ASG will try, filtered to what this region actually offers. It moves to the next one when a pool returns InsufficientInstanceCapacity."
+  value       = local.instance_type_waterfall
+}
+
+output "deployment_azs" {
+  description = "Availability zones the ASG may launch into (one subnet each)"
+  value       = local.deploy_azs
+}
+
+output "capacity_hunt_command" {
+  description = "`apply` does not wait for capacity -- the ASG keeps retrying in the background. This shows what it is doing and why a launch failed."
+  value       = "aws autoscaling describe-scaling-activities --auto-scaling-group-name ${aws_autoscaling_group.llm_gpu.name} --region ${var.aws_region} --max-items 10 --query 'Activities[].[StartTime,StatusCode,StatusMessage]' --output table"
+}
+
+output "instance_id_command" {
+  description = "The instance ID is assigned at launch, not at plan time. This resolves it."
+  value       = "aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${aws_autoscaling_group.llm_gpu.name} --region ${var.aws_region} --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text"
+}
+
+output "lifecycle_commands" {
+  description = "Day-to-day start/stop. The in-VM guardrails STOP the instance (root volume and model cache survive); scaling to zero TERMINATES it."
+  value = join("\n", [
+    "# restart after a TTL/idle stop (keeps the model cache):",
+    "aws ec2 start-instances --region ${var.aws_region} --instance-ids $(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ${aws_autoscaling_group.llm_gpu.name} --region ${var.aws_region} --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)",
+    "# scale to zero (terminates the instance and its root volume):",
+    "aws autoscaling set-desired-capacity --region ${var.aws_region} --auto-scaling-group-name ${aws_autoscaling_group.llm_gpu.name} --desired-capacity 0",
+    "# bring it back (re-runs the whole hunt and re-provisions from scratch):",
+    "aws autoscaling set-desired-capacity --region ${var.aws_region} --auto-scaling-group-name ${aws_autoscaling_group.llm_gpu.name} --desired-capacity 1",
+  ])
 }
 
 output "public_ip" {
-  description = "Elastic IP attached to the GPU VM"
+  description = "Elastic IP for the GPU VM. Allocated up front and claimed by the instance on first boot, so it is stable across stop/start and across a relaunch into a different AZ."
   value       = aws_eip.llm_gpu.public_ip
 }
 
@@ -60,11 +92,11 @@ output "h3_curl_example" {
 }
 
 output "auto_stop_summary" {
-  description = "Active cost guardrails. Three independent layers stop the VM; the nightly cron is only the last one."
+  description = "Active cost guardrails. Three independent layers; only the nightly one terminates."
   value = join(" | ", [
     var.auto_stop_hours > 0 ? "hard TTL: stops ${var.auto_stop_hours}h after boot" : "hard TTL: DISABLED",
     var.idle_stop_minutes > 0 ? "idle stop: after ${var.idle_stop_minutes}min idle" : "idle stop: DISABLED",
-    "nightly cron: 01:00 Europe/Amsterdam",
+    "nightly: 01:00 Europe/Amsterdam, ASG desired=0 (TERMINATES, model cache is lost)",
   ])
 }
 
@@ -82,7 +114,7 @@ output "vpc_id" {
   value       = aws_vpc.llm.id
 }
 
-output "subnet_id" {
-  description = "ID of the public subnet hosting the GPU VM"
-  value       = aws_subnet.public.id
+output "subnet_ids" {
+  description = "Public subnets, one per candidate availability zone"
+  value       = { for az, s in aws_subnet.public : az => s.id }
 }

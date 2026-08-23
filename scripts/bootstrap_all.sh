@@ -258,5 +258,5 @@ is_enabled "${ENABLE_ASR}"               && log "  Speech-to-Text (${ASR_MODEL})
 is_enabled "${ENABLE_H3}"                && log "  MiniMax-H3 video UI         : http://<EIP>:7865"
 is_enabled "${ENABLE_H3}"                && log "  MiniMax-H3 REST API         : http://<EIP>:30010/v1/videos"
 log ""
-log "  Autostop: hard TTL=${AUTO_STOP_HOURS}h, idle stop=${IDLE_STOP_MINUTES}min, nightly cron 01:00."
+log "  Autostop: hard TTL=${AUTO_STOP_HOURS}h, idle stop=${IDLE_STOP_MINUTES}min, nightly ASG scale-to-zero 01:00."
 log "  Check it with: systemctl list-timers 'llm-lab-*'"

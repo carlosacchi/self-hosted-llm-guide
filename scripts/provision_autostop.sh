@@ -12,17 +12,26 @@ set -euo pipefail
 #   1. Hard TTL      systemd timer, N hours after boot, unconditionally.
 #   2. Idle stop     systemd timer, every 5 min: stop after N minutes with an
 #                    idle GPU and no user traffic on the service ports.
-#   3. Nightly cron  EventBridge Scheduler, 01:00 Europe/Amsterdam
-#                    (infra/operations.tf) -- the pre-existing backstop.
+#   3. Nightly       EventBridge Scheduler, 01:00 Europe/Amsterdam
+#                    (infra/operations.tf). Sets the Auto Scaling group's
+#                    desired capacity to 0, which TERMINATES the instance.
 #
 # Layers 1 and 2 live inside the VM and call `systemctl poweroff`. On an
 # EBS-backed instance an OS shutdown STOPS the instance rather than terminating
-# it (Terraform pins instance_initiated_shutdown_behavior = "stop" in
-# infra/compute.tf), so the root volume and the model cache survive untouched
-# and no extra IAM permissions are needed.
+# it (Terraform pins instance_initiated_shutdown_behavior = "stop" in the launch
+# template), so the root volume and the model cache survive untouched and no
+# extra IAM permissions are needed.
+#
+# That still holds now that the instance is owned by an Auto Scaling group, but
+# only because of one deliberate choice: the group runs with HealthCheck,
+# ReplaceUnhealthy and AZRebalance suspended. A default ASG would fail the
+# stopped instance's health check, terminate it, and launch a replacement --
+# turning this guardrail into a billing loop at ~$13/hour. If you ever un-suspend
+# those processes, these two layers must be rewritten to call
+# `aws autoscaling set-desired-capacity --desired-capacity 0` instead.
 #
 # Why this matters: a g6e.12xlarge bills at roughly $13/hour in eu-central-1.
-# Booting at 09:00 and relying only on the 01:00 cron costs about $210 for a
+# Booting at 09:00 and relying only on the 01:00 nightly costs about $210 for a
 # day nobody was using the box.
 #
 # Usage:
@@ -318,7 +327,7 @@ main() {
   log "=== Autostop guardrails installed ==="
   log "  Hard TTL   : ${AUTO_STOP_HOURS}h after boot (0 = off)"
   log "  Idle stop  : ${IDLE_STOP_MINUTES} min idle (0 = off)"
-  log "  Nightly    : 01:00 Europe/Amsterdam (EventBridge, see infra/operations.tf)"
+  log "  Nightly    : 01:00 Europe/Amsterdam, ASG desired=0 (see infra/operations.tf)"
   log ""
   log "  Inspect    : systemctl list-timers 'llm-lab-*'"
   log "  Idle log   : journalctl -t llm-lab-idle"
@@ -326,8 +335,13 @@ main() {
   log "  Pin awake  : sudo touch /run/llm-lab-busy   (removes on reboot)"
   log ""
   log "  A poweroff STOPS this instance, it does not terminate it: the root"
-  log "  volume and any cached models survive. Restart it from the AWS console"
-  log "  or with: aws ec2 start-instances --instance-ids <id>"
+  log "  volume and any cached models survive. The Auto Scaling group will not"
+  log "  replace it, because HealthCheck/ReplaceUnhealthy are suspended."
+  log "  Restart it from the AWS console or with:"
+  log "    aws ec2 start-instances --instance-ids <id>"
+  log ""
+  log "  The NIGHTLY layer is different: it terminates. Anything not on a"
+  log "  snapshot has to be downloaded again the next morning."
 }
 
 main "$@"
