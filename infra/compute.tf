@@ -184,6 +184,7 @@ resource "aws_launch_template" "llm_gpu" {
       volume_size           = var.root_volume_size
       volume_type           = "gp3"
       throughput            = var.root_volume_throughput
+      iops                  = local.root_volume_iops
       delete_on_termination = "true"
       encrypted             = "true"
     }
@@ -259,6 +260,13 @@ resource "aws_launch_template" "llm_gpu" {
     precondition {
       condition     = length(local.deploy_azs) > 0
       error_message = "availability_zone = \"${var.availability_zone}\" does not offer any of ${join(", ", local.requested_instance_types)}. Capable zones in ${var.aws_region}: ${join(", ", local.candidate_azs)}. Leave availability_zone empty to let the Auto Scaling group search all of them."
+    }
+
+    # EC2 enforces this at RunInstances, which under an ASG means a failed
+    # scaling activity minutes after a successful apply. Catch it in plan.
+    precondition {
+      condition     = local.root_volume_iops * 0.25 >= var.root_volume_throughput
+      error_message = "gp3 allows at most 0.25 MiB/s of throughput per provisioned IOPS. root_volume_throughput = ${var.root_volume_throughput} needs at least ${ceil(var.root_volume_throughput * 4)} IOPS, but root_volume_iops resolves to ${local.root_volume_iops}. Raise root_volume_iops or leave it at 0 to derive it."
     }
   }
 }
@@ -376,7 +384,10 @@ resource "aws_autoscaling_group" "llm_gpu" {
     }
   }
 
-  depends_on = [aws_s3_object.scripts]
+  depends_on = [
+    aws_s3_object.scripts,
+    time_sleep.instance_profile_propagation,
+  ]
 }
 
 # Allocated by Terraform, attached by the instance.

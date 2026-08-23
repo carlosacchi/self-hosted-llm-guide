@@ -161,3 +161,15 @@ resource "aws_iam_instance_profile" "llm_gpu" {
     Name = "llm-gpu-instance-profile"
   }, local.lab_tags)
 }
+
+# IAM instance profiles are eventually consistent towards EC2. A bare
+# aws_instance would retry the "Invalid IAM Instance Profile" error itself, but
+# an Auto Scaling group launches asynchronously: it fires within seconds of
+# being created, gets back a bare "Authentication Failure", and burns a couple
+# of minutes of backoff before succeeding. This makes the first apply clean.
+resource "time_sleep" "instance_profile_propagation" {
+  count = var.run_bootstrap ? 1 : 0
+
+  depends_on      = [aws_iam_instance_profile.llm_gpu]
+  create_duration = "30s"
+}

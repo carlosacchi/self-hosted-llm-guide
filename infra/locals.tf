@@ -32,4 +32,11 @@ locals {
     [var.instance_type],
     length(var.instance_type_fallbacks) > 0 ? var.instance_type_fallbacks : local.default_instance_type_fallbacks,
   ))
+
+  # gp3 refuses more than 0.25 MiB/s of throughput per provisioned IOPS, and it
+  # refuses it at RunInstances time -- so under an ASG the rejection shows up as
+  # a failed scaling activity minutes later, not as a Terraform error. 1000 MiB/s
+  # (the H3 setting) against the 3000 IOPS default is a ratio of 0.33 and always
+  # fails. Derive the smallest legal value instead of making the caller do it.
+  root_volume_iops = var.root_volume_iops > 0 ? var.root_volume_iops : max(3000, var.root_volume_throughput * 4)
 }

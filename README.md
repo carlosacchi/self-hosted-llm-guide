@@ -282,7 +282,7 @@ Go to **Actions → Manage GPU VM → Run workflow** and fill in:
 | `asr` | `none` / `whisper-large-v3` / `granite-8b` — ignored for `minimax-h3` | `none` |
 | `auto_stop_hours` | Hard TTL from boot; `0` disables it | `4` |
 
-> `workflow_dispatch` caps a workflow at **10 inputs** and this list uses all 10. That is why `workload` is a single picker rather than separate `enable_llm` / `enable_tts` booleans — the stacks were never freely combinable anyway (they compete for the same VRAM, and H3 is exclusive by construction). Root volume size and throughput are derived from `workload`; override them with `TF_VAR_root_volume_size` / `TF_VAR_root_volume_throughput`. The instance-type waterfall is derived too; override it with `TF_VAR_instance_type_fallbacks`.
+> `workflow_dispatch` caps a workflow at **10 inputs** and this list uses all 10. That is why `workload` is a single picker rather than separate `enable_llm` / `enable_tts` booleans — the stacks were never freely combinable anyway (they compete for the same VRAM, and H3 is exclusive by construction). Root volume size and throughput are derived from `workload`; override them with `TF_VAR_root_volume_size` / `TF_VAR_root_volume_throughput`. IOPS is derived from throughput (gp3 caps the ratio at 0.25 MiB/s per IOPS, so 1000 MiB/s forces 4000 IOPS); override with `TF_VAR_root_volume_iops`. The instance-type waterfall is derived too; override it with `TF_VAR_instance_type_fallbacks`.
 
 Terraform outputs (Elastic IP, app URLs, the instance-type waterfall, the H3 curl example, and the active autostop summary) are printed at the end of the job, followed by the ASG's scaling activities — that last table is where you find out whether a GPU was actually found, and why not.
 

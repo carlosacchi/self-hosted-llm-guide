@@ -159,6 +159,17 @@ variable "root_volume_throughput" {
   }
 }
 
+variable "root_volume_iops" {
+  description = "Root gp3 IOPS (3000-16000). Leave at 0 to derive the smallest legal value for the requested throughput. gp3 caps the throughput:IOPS ratio at 0.25 MiB/s per IOPS, so 1000 MiB/s needs at least 4000 IOPS -- asking for 1000 MiB/s at the 3000 IOPS default is rejected by EC2 at launch time, not at plan time."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.root_volume_iops == 0 || (var.root_volume_iops >= 3000 && var.root_volume_iops <= 16000)
+    error_message = "gp3 IOPS must be 0 (derive automatically) or between 3000 and 16000."
+  }
+}
+
 # --- Cost guardrails ----------------------------------------------------------
 # The nightly EventBridge stop (operations.tf) is the last line of defense, not
 # the first. On a g6e.12xlarge (~$13/h in eu-central-1) forgetting the VM running
