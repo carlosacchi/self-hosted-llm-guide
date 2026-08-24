@@ -220,13 +220,26 @@ fi
 device="\${devices[0]}"
 log "Using \${device} for scratch and swap (\${#devices[@]} instance-store device(s) present)."
 
-if ! blkid "\${device}" >/dev/null 2>&1; then
-  log "Formatting \${device} as ext4 (fresh after instance stop)..."
-  mkfs.ext4 -F -m 0 -E lazy_itable_init=1,lazy_journal_init=1 "\${device}"
+mkdir -p "\${NVME_MOUNT}"
+
+# The Deep Learning AMI formats and mounts the instance store on its own (at
+# /opt/dlami/nvme). ext4 refuses a second mount of the same device, so bind the
+# existing mountpoint instead of failing the unit -- and with it the bootstrap.
+existing_mount="\$(lsblk -no MOUNTPOINT "\${device}" | awk 'NF {print; exit}')"
+
+if mountpoint -q "\${NVME_MOUNT}"; then
+  log "\${NVME_MOUNT} is already a mountpoint; leaving it alone."
+elif [[ -n "\${existing_mount}" ]]; then
+  log "\${device} is already mounted at \${existing_mount}; bind-mounting it to \${NVME_MOUNT}."
+  mount --bind "\${existing_mount}" "\${NVME_MOUNT}"
+else
+  if ! blkid "\${device}" >/dev/null 2>&1; then
+    log "Formatting \${device} as ext4 (fresh after instance stop)..."
+    mkfs.ext4 -F -m 0 -E lazy_itable_init=1,lazy_journal_init=1 "\${device}"
+  fi
+  mount -o discard,noatime "\${device}" "\${NVME_MOUNT}"
 fi
 
-mkdir -p "\${NVME_MOUNT}"
-mountpoint -q "\${NVME_MOUNT}" || mount -o discard,noatime "\${device}" "\${NVME_MOUNT}"
 mkdir -p "\${NVME_SCRATCH}"
 chmod 1777 "\${NVME_SCRATCH}"
 
@@ -268,8 +281,21 @@ EOF
 
   systemctl daemon-reload
   systemctl enable llm-lab-nvme-scratch.service
-  systemctl start llm-lab-nvme-scratch.service
-  log "NVMe scratch/swap unit installed and started."
+
+  # Non-fatal on purpose: the swap cushion is insurance, not a dependency. On a
+  # ~$13/h box, aborting the whole bootstrap here means paying for an instance
+  # that never downloads the model.
+  if systemctl start llm-lab-nvme-scratch.service; then
+    log "NVMe scratch/swap unit installed and started."
+  else
+    log "WARNING: llm-lab-nvme-scratch.service failed; continuing WITHOUT the swap cushion."
+    log "         H3 will run closer to the host-RAM ceiling - watch free RAM."
+    log "         Diagnose with: journalctl -xeu llm-lab-nvme-scratch.service"
+    systemctl status --no-pager --full llm-lab-nvme-scratch.service || true
+    # Keep the path valid so the SGLang container's -v mount still resolves,
+    # falling back to the root volume.
+    mkdir -p "${NVME_SCRATCH}"
+  fi
 }
 
 ########################################
