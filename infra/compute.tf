@@ -224,6 +224,7 @@ resource "aws_launch_template" "llm_gpu" {
     asr_model                 = var.asr_model
     enable_h3                 = var.enable_h3
     h3_variant                = var.h3_variant
+    h3_model_variant          = var.h3_model_variant
     h3_sglang_image           = var.h3_sglang_image
 
     # Cost guardrails, applied to every workload (not just H3).
@@ -366,8 +367,13 @@ resource "aws_autoscaling_group" "llm_gpu" {
     }
 
     precondition {
-      condition     = !var.enable_h3 || var.root_volume_size >= 300
-      error_message = "enable_h3 requires root_volume_size >= 300 GiB. The FL2VA partition alone is ~144 GB on disk (the HF repo also ships a Ref2VA partition and a parallel diffusers layout, ~498 GB in total, which this stack deliberately does NOT download), plus the pinned SGLang image, CUDA/torch layers and generated MP4s. 200 GiB fills up mid-provisioning."
+      condition     = !var.enable_h3 || var.root_volume_size >= (var.h3_variant == "both" ? 500 : 300)
+      error_message = "enable_h3 with h3_variant = \"${var.h3_variant}\" requires root_volume_size >= ${var.h3_variant == "both" ? 500 : 300} GiB. Each checkpoint partition is ~144 GB on disk (the HF repo also ships a parallel diffusers layout, ~498 GB in total, which this stack deliberately does NOT download), plus the pinned SGLang image, CUDA/torch layers and generated MP4s."
+    }
+
+    precondition {
+      condition     = !var.enable_h3 || var.h3_model_variant == "" || var.h3_variant == "both" || var.h3_model_variant == var.h3_variant
+      error_message = "h3_model_variant = \"${var.h3_model_variant}\" cannot be served: h3_variant = \"${var.h3_variant}\" only downloads that one partition. Set h3_variant to \"${var.h3_model_variant}\", or to \"both\" to keep either partition available for a runtime switch."
     }
 
     precondition {

@@ -234,7 +234,7 @@ scripts/
   provision_vibevoice_tts_stack.sh  Python venv + VibeVoice-1.5B (community fork) multi-speaker podcast UI (port 7861)
   provision_vibevoice_stack.sh  Python venv + VibeVoice-Realtime-0.5B + web UI (disabled by default, port 7862)
   provision_asr_stack.sh        Python venv + Whisper/Granite speech-to-text UI (port 7864)
-  provision_h3_stack.sh         NVMe scratch+swap, FL2VA checkpoint, pinned SGLang container (port 30010)
+  provision_h3_stack.sh         NVMe scratch+swap, FL2VA/Ref2VA checkpoint, pinned SGLang container (port 30010)
   provision_h3_ui_stack.sh      Gradio wrapper around the async video API (port 7865)
   provision_autostop.sh         Hard-TTL and idle-stop systemd timers (all workloads)
   provision_landing_stack.sh    nginx + service portal listing the stacks that were installed (port 80)
@@ -364,7 +364,7 @@ cloud-init (user-data.sh)
         │     ├── preflight: 2 or 4 GPUs, >=350 GiB RAM, >=220 GB free — fail fast, this box is expensive
         │     ├── derives the parallelism flags from the GPU count the ASG actually landed on
         │     ├── installs llm-lab-nvme-scratch.service (NVMe scratch + 256 GiB swap, re-run every boot)
-        │     ├── downloads only the FL2VA partition (~144 GB) into /opt/models on EBS
+        │     ├── downloads the requested partition(s) (~144 GB each) into /opt/models on EBS
         │     ├── pulls the PINNED SGLang image (never :latest)
         │     ├── registers sglang-h3.service (systemd, port 30010)
         │     └── registers h3-ui.service (Gradio wrapper, port 7865)
@@ -427,7 +427,7 @@ curl http://localhost:11434/api/tags
      Netdata      Gradio UI       SGLang          NVMe scratch
       :19999        :7865          :30010          + 256 GiB swap
                        └──────────────┤
-                                 MiniMax-H3 (FL2VA)
+                                 MiniMax-H3 (FL2VA / Ref2VA)
                                       │
                                   /v1/videos → MP4 + audio
 ```
@@ -443,11 +443,29 @@ curl http://localhost:11434/api/tags
 
 The generation estimate is extrapolated, not measured on this exact box: the closest published datapoint is 559 s (~9.3 min) for a 1344×768 / 124-frame / 50-step clip on 2× RTX 5090 with layerwise offload. **L40S has no NVLink**, so parallelism crosses PCIe and the H100/H200 numbers in the SGLang cookbook do not transfer. Measure it on your first run and replace this paragraph.
 
-### Only the FL2VA partition is served
+### Choosing a checkpoint partition
 
-`--model-variant fl2va` covers **both** text-to-video-and-audio (`t2va`) and first/last-frame conditioning (`fl2va`). The `ref2va` partition is deliberately **not** deployed and is rejected by Terraform validation: on 4× L40S (compute capability 8.9) it produces snow/noise on every run while FL2VA is healthy on the identical box — [sgl-project/sglang#34110](https://github.com/sgl-project/sglang/issues/34110).
+H3 splits its capabilities across two checkpoint partitions, and one SGLang server can only mount one of them:
 
-That also halves the download. The Hugging Face repo is **~498 GB in total** because it ships four overlapping things: a self-contained FL2VA pipeline (144 GB), a self-contained Ref2VA pipeline (144 GB), and a parallel root-level diffusers layout (~210 GB). This stack fetches **only FL2VA plus the small root metadata: ~144 GB**.
+| `h3_variant` | Tasks served | Conditioning |
+|---|---|---|
+| `fl2va` (default) | `t2va`, `fl2va` | none, or a first frame, a last frame, or both |
+| `ref2va` | `ref2va` | image, video and audio references |
+| `both` | either, one at a time | downloads ~288 GB and lets you switch without re-downloading |
+
+Switch the **served** partition on a running box without touching code:
+
+```bash
+sudo sed -i 's/^H3_MODEL_VARIANT=.*/H3_MODEL_VARIANT=ref2va/' /etc/llm-lab-h3.env
+sudo systemctl restart sglang-h3
+docker inspect sglang-h3 --format '{{json .Config.Cmd}}' | jq   # must show --model-variant ref2va
+```
+
+The launcher refuses to start if that partition's weights are not on disk, naming the command that downloads them, instead of letting SGLang fail with a bare `no safetensors files found`.
+
+> **`ref2va` on L40S**: on compute capability 8.9 (the 4× L40S `g6e.12xlarge` shape) `ref2va` produces snow/noise on every run while `fl2va` is healthy on the identical box — [sgl-project/sglang#34110](https://github.com/sgl-project/sglang/issues/34110). The provisioner warns when it detects that combination. The RTX PRO 6000 Blackwell (`g7e.12xlarge`, sm_120) is not affected.
+
+The Hugging Face repo is **~498 GB in total** because it ships four overlapping things: a self-contained FL2VA pipeline (144 GB), a self-contained Ref2VA pipeline (144 GB), and a parallel root-level diffusers layout (~210 GB). This stack fetches **only the requested partition(s) plus the small root metadata**, never the diffusers layout. `h3_variant = "both"` therefore needs `root_volume_size >= 500`, enforced as a `terraform plan` precondition.
 
 ### Using the API
 
@@ -481,7 +499,7 @@ The Gradio UI on `:7865` does all three for you and shows a progress bar.
 
 | Path | Backing | Survives a stop? | Holds |
 |---|---|---|---|
-| `/opt/models/MiniMax-H3` | root gp3 EBS | ✅ yes | the 144 GB FL2VA checkpoint |
+| `/opt/models/MiniMax-H3` | root gp3 EBS | ✅ yes | the ~144 GB checkpoint partition(s) |
 | `/mnt/nvme/scratch` | instance store | ❌ wiped | temp files, HF metadata, intermediates |
 | `/mnt/nvme/swapfile` | instance store | ❌ recreated on boot | 256 GiB swap cushion |
 

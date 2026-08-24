@@ -16,6 +16,9 @@ set -euo pipefail
 #   ENABLE_VIBEVOICE_7B        provision_vibevoice_tts_stack.sh   (VibeVoice 7B multi-speaker, 7863, ~16 GB VRAM)
 #   ENABLE_ASR + ASR_MODEL     provision_asr_stack.sh             (Speech-to-text: audio/video/YouTube -> text, 7864)
 #   ENABLE_H3 + H3_VARIANT     provision_h3_stack.sh              (MiniMax-H3 video+audio, 30010 + UI 7865)
+#                              H3_VARIANT selects the checkpoint partition(s) to
+#                              download: fl2va | ref2va | both. H3_MODEL_VARIANT
+#                              selects which one is served.
 #
 # The autostop guardrails (provision_autostop.sh) and the landing portal
 # (nginx, port 80) always run last. Defaults (when an env var is unset) match
@@ -57,6 +60,9 @@ ENABLE_ASR="${ENABLE_ASR:-false}"
 ASR_MODEL="${ASR_MODEL:-whisper-large-v3}"
 ENABLE_H3="${ENABLE_H3:-false}"
 H3_VARIANT="${H3_VARIANT:-fl2va}"
+# Which downloaded partition the service mounts; defaults to H3_VARIANT unless
+# both were downloaded, where provision_h3_stack.sh falls back to fl2va.
+H3_MODEL_VARIANT="${H3_MODEL_VARIANT:-}"
 H3_SGLANG_IMAGE="${H3_SGLANG_IMAGE:-lmsysorg/sglang:v0.5.17-cu129}"
 
 # Cost guardrails (see provision_autostop.sh). Installed for every workload.
@@ -150,11 +156,11 @@ if is_enabled "${ENABLE_H3}"; then
     exit 1
   fi
 
-  if [[ "${H3_VARIANT,,}" != "fl2va" ]]; then
-    log "FATAL: H3_VARIANT='${H3_VARIANT}' is not supported; only 'fl2va' is."
-    log "       The ref2va partition produces snow/noise on every run on L40S-class"
-    log "       GPUs (compute capability 8.9): https://github.com/sgl-project/sglang/issues/34110"
-    log "       fl2va already serves both t2va and first/last-frame conditioning."
+  if ! [[ "${H3_VARIANT,,}" =~ ^(fl2va|ref2va|both)$ ]]; then
+    log "FATAL: H3_VARIANT='${H3_VARIANT}' is not supported; use fl2va, ref2va or both."
+    log "       fl2va serves t2va + first/last-frame conditioning, ref2va serves"
+    log "       image/video/audio reference conditioning, both keeps ~288 GB on disk"
+    log "       and lets you switch with H3_MODEL_VARIANT + a service restart."
     exit 1
   fi
 fi
@@ -218,8 +224,8 @@ else
 fi
 
 if is_enabled "${ENABLE_H3}"; then
-  log "=== MiniMax-H3 video+audio stack (SGLang REST 30010, variant=${H3_VARIANT}) ==="
-  H3_VARIANT="${H3_VARIANT}" H3_SGLANG_IMAGE="${H3_SGLANG_IMAGE}" \
+  log "=== MiniMax-H3 video+audio stack (SGLang REST 30010, download=${H3_VARIANT} serve=${H3_MODEL_VARIANT:-auto}) ==="
+  H3_VARIANT="${H3_VARIANT}" H3_MODEL_VARIANT="${H3_MODEL_VARIANT}" H3_SGLANG_IMAGE="${H3_SGLANG_IMAGE}" \
     bash "${HERE}/provision_h3_stack.sh"
 
   log "=== MiniMax-H3 Gradio UI (port 7865) ==="

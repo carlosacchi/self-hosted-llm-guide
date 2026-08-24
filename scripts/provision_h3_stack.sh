@@ -35,15 +35,26 @@ set -euo pipefail
 # H100/H200 timings in the SGLang cookbook do not transfer. Expect minutes, not
 # seconds, per clip.
 #
-# Only the fl2va partition is served. ref2va produces snow/noise on every run on
-# compute-capability 8.9 cards while fl2va is healthy on the same box:
-#   https://github.com/sgl-project/sglang/issues/34110
-# fl2va covers both text-to-video-and-audio (t2va) and first/last-frame
-# conditioning, which is the interesting half anyway.
+# H3 ships its capabilities in TWO checkpoint partitions, and one server can
+# only mount one of them:
+#
+#   fl2va   t2va (text only) + first/last-frame conditioning
+#   ref2va  reference-to-video: image, video and audio references
+#
+# H3_VARIANT selects what gets DOWNLOADED (fl2va, ref2va, or both at ~144 GB
+# each); H3_MODEL_VARIANT in /etc/llm-lab-h3.env selects what gets SERVED and is
+# switchable with a service restart once the weights are on disk.
+#
+# Known issue: ref2va produces snow/noise on compute-capability 8.9 cards (L40S,
+# i.e. g6e.12xlarge) while fl2va is healthy on the same box --
+# https://github.com/sgl-project/sglang/issues/34110 -- so this script warns
+# when the two are combined. RTX PRO 6000 Blackwell (sm_120, g7e.12xlarge) is
+# not affected.
 #
 # Usage:
 #   sudo bash provision_h3_stack.sh
-#   sudo H3_SGLANG_IMAGE=lmsysorg/sglang:v0.5.17-cu129 bash provision_h3_stack.sh
+#   sudo H3_VARIANT=ref2va bash provision_h3_stack.sh
+#   sudo H3_VARIANT=both H3_MODEL_VARIANT=ref2va bash provision_h3_stack.sh
 ########################################
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,9 +62,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 H3_NAME="${H3_NAME:-sglang-h3}"
 H3_DIR="${H3_DIR:-/opt/h3}"
 H3_PORT="${H3_PORT:-30010}"
-H3_VARIANT="${H3_VARIANT:-fl2va}"
 H3_SGLANG_IMAGE="${H3_SGLANG_IMAGE:-lmsysorg/sglang:v0.5.17-cu129}"
 H3_REPO_ID="${H3_REPO_ID:-MiniMaxAI/MiniMax-H3}"
+
+# Which partition(s) to download: fl2va, ref2va, or both.
+H3_VARIANT="${H3_VARIANT:-fl2va}"
+H3_VARIANT="${H3_VARIANT,,}"
+
+# Which partition the service mounts. Defaults to the downloaded one; with
+# H3_VARIANT=both it defaults to fl2va and is flipped later by editing
+# /etc/llm-lab-h3.env.
+H3_MODEL_VARIANT="${H3_MODEL_VARIANT:-}"
 
 # Model cache lives on the ROOT EBS VOLUME, never on the instance store: the
 # autostop guardrails stop this VM several times a day and instance storage is
@@ -67,9 +86,6 @@ NVME_MOUNT="${NVME_MOUNT:-/mnt/nvme}"
 NVME_SCRATCH="${NVME_MOUNT}/scratch"
 SWAP_GIB="${SWAP_GIB:-256}"
 
-# Minimum free space for the FL2VA partition (144 GB) plus the SGLang image,
-# CUDA layers and room for generated MP4s.
-MIN_FREE_GB="${MIN_FREE_GB:-220}"
 MIN_RAM_GB="${MIN_RAM_GB:-350}"
 
 # Which GPU topologies this script knows how to configure. The Auto Scaling
@@ -95,6 +111,64 @@ require_root() {
     exit 1
   fi
 }
+
+# SGLang resolves --model-variant to a capitalised partition directory.
+partition_dir() {
+  case "$1" in
+    fl2va)  echo "FL2VA" ;;
+    ref2va) echo "Ref2VA" ;;
+    *)      return 1 ;;
+  esac
+}
+
+# Resolve H3_VARIANT / H3_MODEL_VARIANT into DOWNLOAD_VARIANTS + SERVE_VARIANT,
+# and size the disk check accordingly. Runs before anything expensive.
+resolve_variants() {
+  case "${H3_VARIANT}" in
+    fl2va|ref2va) DOWNLOAD_VARIANTS=("${H3_VARIANT}") ;;
+    both)         DOWNLOAD_VARIANTS=(fl2va ref2va) ;;
+    *)
+      log "FATAL: H3_VARIANT='${H3_VARIANT}' is not supported. Use fl2va, ref2va or both."
+      exit 1
+      ;;
+  esac
+
+  SERVE_VARIANT="${H3_MODEL_VARIANT,,}"
+  SERVE_VARIANT="${SERVE_VARIANT:-${DOWNLOAD_VARIANTS[0]}}"
+
+  if ! partition_dir "${SERVE_VARIANT}" >/dev/null; then
+    log "FATAL: H3_MODEL_VARIANT='${SERVE_VARIANT}' is not supported. Use fl2va or ref2va."
+    exit 1
+  fi
+
+  # Serving a partition that was never downloaded is the exact failure the
+  # runtime guard reports as "no safetensors files found"; catch it here instead.
+  local wanted
+  for wanted in "${DOWNLOAD_VARIANTS[@]}"; do
+    [[ "${wanted}" == "${SERVE_VARIANT}" ]] && return 0
+  done
+  log "FATAL: H3_MODEL_VARIANT='${SERVE_VARIANT}' is not among the downloaded partitions (${DOWNLOAD_VARIANTS[*]})."
+  log "       Use H3_VARIANT=${SERVE_VARIANT}, or H3_VARIANT=both to keep both on disk."
+  exit 1
+}
+
+has_partition_weights() {
+  compgen -G "${H3_MODEL_DIR}/$(partition_dir "$1")/transformer/*.safetensors" >/dev/null
+}
+
+# Only partitions that are NOT already on disk need room. Adding ref2va next to
+# an existing fl2va must not be rejected for the space fl2va already occupies.
+count_missing_variants() {
+  local variant count=0
+  for variant in "${DOWNLOAD_VARIANTS[@]}"; do
+    has_partition_weights "${variant}" || count=$((count + 1))
+  done
+  echo "${count}"
+}
+
+# Each partition is ~144 GB; the rest covers the SGLang image, CUDA layers and
+# generated MP4s.
+MIN_FREE_GB="${MIN_FREE_GB:-}"
 
 # shellcheck source=lib_docker_gpu.sh
 source "${HERE}/lib_docker_gpu.sh"
@@ -124,6 +198,14 @@ preflight() {
     log "    ${line}"
   done
 
+  # sglang#34110: ref2va denoises to snow on compute capability 8.9 (L40S).
+  if [[ "${SERVE_VARIANT}" == "ref2va" ]] &&
+     nvidia-smi --query-gpu=compute_cap --format=csv,noheader | grep -q '^8\.9$'; then
+    log "  WARNING: serving ref2va on a compute-capability 8.9 GPU (L40S)."
+    log "           https://github.com/sgl-project/sglang/issues/34110 reports snow/noise"
+    log "           output for that combination; fl2va is healthy on the same card."
+  fi
+
   if ! grep -qw "${gpu_count}" <<<"${SUPPORTED_GPU_COUNTS}"; then
     if [[ "${H3_ALLOW_ANY_GPU:-false}" == "true" ]]; then
       log "  WARNING: ${gpu_count} GPUs is not a topology this script has a profile for"
@@ -150,11 +232,10 @@ preflight() {
 
   local free_gb
   free_gb="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
-  log "  Free space on /: ${free_gb} GB"
+  log "  Free space on /: ${free_gb} GB (need ${MIN_FREE_GB} for ${MISSING_VARIANTS} partition(s) still to download)"
   if [[ "${free_gb}" -lt "${MIN_FREE_GB}" ]]; then
     log "FATAL: only ${free_gb} GB free on /, need at least ${MIN_FREE_GB}."
-    log "       The FL2VA partition alone is ~144 GB. Raise root_volume_size"
-    log "       (Terraform) to 500 and redeploy."
+    log "       Each partition is ~144 GB. Raise root_volume_size (Terraform) and redeploy."
     exit 1
   fi
 
@@ -299,14 +380,14 @@ EOF
 }
 
 ########################################
-# Step 3: download the FL2VA partition
+# Step 3: download the selected partition(s)
 #
 # The HF repo is ~498 GB in total because it ships FOUR overlapping things:
 # a self-contained FL2VA pipeline (144 GB), a self-contained Ref2VA pipeline
 # (144 GB), and a parallel root-level diffusers layout (transformer,
 # transformer_ref, text_encoder, vae ~210 GB). SGLang's --model-variant selects
-# a partition subdirectory, so we fetch FL2VA plus the small root metadata and
-# skip the other ~354 GB.
+# a partition subdirectory, so we fetch only the requested partition(s) plus the
+# small root metadata and skip the parallel diffusers layout entirely.
 ########################################
 
 create_download_venv() {
@@ -318,21 +399,22 @@ create_download_venv() {
     python3 -m venv "${H3_DIR}/.venv"
   fi
   "${H3_DIR}/.venv/bin/pip" install --quiet --upgrade pip
-  # hf_transfer is a Rust-based multi-connection downloader; on a 100 Gbps
-  # instance it is the difference between saturating the disk and trickling.
-  "${H3_DIR}/.venv/bin/pip" install --quiet "huggingface_hub[hf_transfer]>=0.34"
+  # [cli] pulls the `hf` entry point; Xet is the current high-throughput
+  # transfer path (hf_transfer is deprecated and no longer a valid extra).
+  "${H3_DIR}/.venv/bin/pip" install --quiet "huggingface_hub[cli,hf_xet]>=0.34"
+  "${H3_DIR}/.venv/bin/hf" version || true
   log "Download venv ready."
 }
 
 download_model() {
-  log "Downloading ${H3_REPO_ID} partition '${H3_VARIANT}' into ${H3_MODEL_DIR} ..."
-  log "  ~144 GB. Expect ~3 min at 1000 MiB/s gp3 throughput, ~19 min at the 125 MiB/s default."
+  log "Downloading ${H3_REPO_ID} partition(s) '${DOWNLOAD_VARIANTS[*]}' into ${H3_MODEL_DIR} ..."
+  log "  ~144 GB each. Expect ~3 min at 1000 MiB/s gp3 throughput, ~19 min at the 125 MiB/s default."
   mkdir -p "${H3_MODEL_DIR}"
 
-  HF_HUB_ENABLE_HF_TRANSFER=1 \
+  HF_XET_HIGH_PERFORMANCE=1 \
   H3_REPO_ID="${H3_REPO_ID}" \
   H3_MODEL_DIR="${H3_MODEL_DIR}" \
-  H3_VARIANT="${H3_VARIANT}" \
+  H3_DOWNLOAD_VARIANTS="${DOWNLOAD_VARIANTS[*]}" \
   "${H3_DIR}/.venv/bin/python" - <<'PY'
 import os
 from huggingface_hub import snapshot_download
@@ -340,22 +422,36 @@ from huggingface_hub import snapshot_download
 repo = os.environ["H3_REPO_ID"]
 dest = os.environ["H3_MODEL_DIR"]
 # SGLang resolves --model-variant to a capitalised partition directory.
-variant_dir = {"fl2va": "FL2VA", "ref2va": "Ref2VA"}[os.environ["H3_VARIANT"].lower()]
+partition_dirs = {"fl2va": "FL2VA", "ref2va": "Ref2VA"}
+
+patterns = ["*.json", "LICENSE", "README.md"]
+for variant in os.environ["H3_DOWNLOAD_VARIANTS"].split():
+    patterns.append(f"{partition_dirs[variant]}/**")
 
 # local_dir gives a plain directory tree (no blobs/ + symlink cache), so the
 # container mount is a single physical copy and `du` tells the truth.
 path = snapshot_download(
     repo_id=repo,
     local_dir=dest,
-    allow_patterns=[f"{variant_dir}/**", "*.json", "LICENSE", "README.md"],
+    allow_patterns=patterns,
     max_workers=16,
 )
 print("Downloaded to:", path)
 PY
 
-  local size
-  size="$(du -sh "${H3_MODEL_DIR}" | cut -f1)"
-  log "Checkpoint on disk: ${size}"
+  local variant dir
+  for variant in "${DOWNLOAD_VARIANTS[@]}"; do
+    dir="${H3_MODEL_DIR}/$(partition_dir "${variant}")"
+    # snapshot_download exits 0 on an allow_patterns typo that matched nothing,
+    # and SGLang then reports a bare "no safetensors files found" at startup.
+    if ! compgen -G "${dir}/transformer/*.safetensors" >/dev/null; then
+      log "FATAL: no .safetensors in ${dir}/transformer after download."
+      log "       The '${variant}' partition did not land. Check the log above for HTTP or disk errors."
+      exit 1
+    fi
+    log "  ${variant}: $(du -sh "${dir}" | cut -f1) at ${dir}"
+  done
+  log "Checkpoint on disk: $(du -sh "${H3_MODEL_DIR}" | cut -f1) total"
 }
 
 ########################################
@@ -404,6 +500,13 @@ install_systemd_service() {
   fi
 
   cat > /etc/llm-lab-h3.env <<EOF
+# Checkpoint partition to serve. Switch it here and restart the service:
+#   fl2va   t2va (text only) + first/last-frame conditioning
+#   ref2va  image / video / audio reference conditioning
+# The weights must already be on disk; provision them with
+#   sudo H3_VARIANT=<variant> bash provision_h3_stack.sh
+H3_MODEL_VARIANT=${SERVE_VARIANT}
+
 H3_NUM_GPUS=${H3_NUM_GPUS:-${DETECTED_GPUS}}
 H3_TP_SIZE=${H3_TP_SIZE:-2}
 H3_ULYSSES=${H3_ULYSSES:-${default_ulysses}}
@@ -419,6 +522,27 @@ set -euo pipefail
 
 # shellcheck disable=SC1091
 source /etc/llm-lab-h3.env
+
+# The served partition is a runtime setting, NOT baked into this script: edit
+# H3_MODEL_VARIANT in /etc/llm-lab-h3.env and restart sglang-h3.
+variant="\${H3_MODEL_VARIANT:-fl2va}"
+variant="\${variant,,}"
+case "\${variant}" in
+  fl2va)  partition=FL2VA ;;
+  ref2va) partition=Ref2VA ;;
+  *)
+    echo "FATAL: H3_MODEL_VARIANT='\${variant}' is not supported (fl2va|ref2va)." >&2
+    exit 1
+    ;;
+esac
+
+# SGLang's own message for a missing partition is a bare "no safetensors files
+# found"; name the knob that actually needs changing instead.
+if ! compgen -G "${H3_MODEL_DIR}/\${partition}/transformer/*.safetensors" >/dev/null; then
+  echo "FATAL: \${partition} weights are not on disk at ${H3_MODEL_DIR}/\${partition}." >&2
+  echo "       Download them with: sudo H3_VARIANT=\${variant} bash provision_h3_stack.sh" >&2
+  exit 1
+fi
 
 extra_args=()
 if [[ "\${H3_DIT_CPU_OFFLOAD}" == "true" ]]; then
@@ -437,7 +561,7 @@ exec docker run --rm --name ${H3_NAME} \\
   ${H3_SGLANG_IMAGE} \\
   sglang serve \\
     --model-path /models/MiniMax-H3 \\
-    --model-variant ${H3_VARIANT} \\
+    --model-variant "\${variant}" \\
     --num-gpus "\${H3_NUM_GPUS}" \\
     --tp-size "\${H3_TP_SIZE}" \\
     --ulysses-degree "\${H3_ULYSSES}" \\
@@ -454,7 +578,7 @@ EOF
 
   cat > "/etc/systemd/system/${H3_NAME}.service" <<EOF
 [Unit]
-Description=MiniMax-H3 video+audio generation (SGLang-Diffusion, ${H3_VARIANT})
+Description=MiniMax-H3 video+audio generation (SGLang-Diffusion)
 After=docker.service network-online.target llm-lab-nvme-scratch.service
 Requires=docker.service
 Wants=llm-lab-nvme-scratch.service
@@ -528,7 +652,13 @@ wait_for_ready() {
 
 main() {
   require_root
-  log "Provisioning MiniMax-H3 (variant=${H3_VARIANT}, image=${H3_SGLANG_IMAGE})"
+  resolve_variants
+
+  MISSING_VARIANTS="$(count_missing_variants)"
+  MIN_FREE_GB="${MIN_FREE_GB:-$(( 40 + 150 * MISSING_VARIANTS ))}"
+
+  log "Provisioning MiniMax-H3 (download=${DOWNLOAD_VARIANTS[*]}, serve=${SERVE_VARIANT}, image=${H3_SGLANG_IMAGE})"
+  log "  Partitions still to download: ${MISSING_VARIANTS} of ${#DOWNLOAD_VARIANTS[@]}"
 
   preflight
   install_system_deps
@@ -543,13 +673,15 @@ main() {
 
   log ""
   log "=== MiniMax-H3 stack ready ==="
-  log "  Model dir : ${H3_MODEL_DIR} (partition ${H3_VARIANT})"
+  log "  Model dir : ${H3_MODEL_DIR} (on disk: ${DOWNLOAD_VARIANTS[*]})"
+  log "  Serving   : ${SERVE_VARIANT} -> tasks $( [[ ${SERVE_VARIANT} == fl2va ]] && echo 't2va, fl2va' || echo 'ref2va' )"
   log "  REST API  : http://<EIP>:${H3_PORT}/v1/videos"
   log "  Scratch   : ${NVME_SCRATCH} (instance store, wiped on stop)"
   log ""
   log "  Status    : sudo systemctl status ${H3_NAME}"
   log "  Logs      : sudo journalctl -fu ${H3_NAME}"
   log "  Tuning    : sudo nano /etc/llm-lab-h3.env && sudo systemctl restart ${H3_NAME}"
+  log "  Variant   : set H3_MODEL_VARIANT in /etc/llm-lab-h3.env, then restart the service"
   log ""
   log "  Reminder: this box bills at roughly \$13/hour. Generation is minutes per"
   log "  clip on PCIe-connected L40S, so a single 5s video costs a couple of"

@@ -239,9 +239,11 @@ with gr.Blocks(title="MiniMax-H3 — video + audio") as demo:
             info_out = gr.Textbox(label="Details", lines=4, show_copy_button=True)
 
     gr.Markdown(
-        "Only the **fl2va** checkpoint partition is served, which covers text-to-video "
-        "(`t2va`) and first/last-frame conditioning. The `ref2va` partition is "
-        "deliberately not deployed: it produces noise on L40S-class GPUs "
+        "This UI submits `t2va` (text-only) requests, served by the **fl2va** checkpoint "
+        "partition. The partition the backend mounts is set by `H3_MODEL_VARIANT` in "
+        "`/etc/llm-lab-h3.env` (`fl2va` for `t2va`/`fl2va`, `ref2va` for reference "
+        "conditioning); change it there and restart `sglang-h3`. Note that `ref2va` "
+        "produces noise on L40S-class GPUs "
         "([sglang#34110](https://github.com/sgl-project/sglang/issues/34110))."
     )
 

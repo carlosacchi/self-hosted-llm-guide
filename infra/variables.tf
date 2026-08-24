@@ -126,13 +126,24 @@ variable "enable_h3" {
 }
 
 variable "h3_variant" {
-  description = "MiniMax-H3 checkpoint partition. Only 'fl2va' is supported here (it serves both t2va and fl2va tasks)."
+  description = "MiniMax-H3 checkpoint partition(s) to download: 'fl2va' (t2va + first/last-frame conditioning), 'ref2va' (image/video/audio reference conditioning), or 'both' (~288 GB on disk, switchable at runtime)."
   type        = string
   default     = "fl2va"
 
   validation {
-    condition     = contains(["fl2va"], var.h3_variant)
-    error_message = "Only 'fl2va' is supported. The 'ref2va' partition is deliberately excluded: on 4x L40S (compute capability 8.9) it produces snow/noise output on every run, while fl2va is healthy on the same hardware. See https://github.com/sgl-project/sglang/issues/34110. fl2va covers text-to-video-and-audio (t2va) and first/last-frame conditioning."
+    condition     = contains(["fl2va", "ref2va", "both"], var.h3_variant)
+    error_message = "h3_variant must be 'fl2va', 'ref2va' or 'both'. Note that ref2va produces snow/noise output on compute-capability 8.9 GPUs (the 4x L40S g6e.12xlarge shape) while fl2va is healthy on the same hardware -- see https://github.com/sgl-project/sglang/issues/34110. It is unaffected on the RTX PRO 6000 Blackwell (g7e.12xlarge)."
+  }
+}
+
+variable "h3_model_variant" {
+  description = "Which downloaded partition the SGLang service mounts. Empty follows h3_variant (and picks fl2va when both are downloaded). Switchable later on the VM via H3_MODEL_VARIANT in /etc/llm-lab-h3.env."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = contains(["", "fl2va", "ref2va"], var.h3_model_variant)
+    error_message = "h3_model_variant must be empty, 'fl2va' or 'ref2va'. 'both' is a download option, not something a single server can mount."
   }
 }
 
