@@ -8,21 +8,25 @@ locals {
 
   ingress_ipv4_cidr = "${var.ipv4_allowed}/32"
 
-  # Instance types that can actually host MiniMax-H3. Both carry 192 GB of total
-  # VRAM, which is still not enough to hold the model resident -- layerwise
-  # offload to host RAM is mandatory on either -- but they are the only two
-  # shapes here where that is even arguable:
+  # Instance types that can actually host MiniMax-H3. Only one qualifies:
   #
-  #   g6e.12xlarge  4x L40S 48 GB          384 GiB RAM
-  #   g7e.12xlarge  2x RTX PRO 6000 96 GB  512 GiB RAM
+  #   g7e.12xlarge  2x RTX PRO 6000 96 GB (sm_120)  512 GiB RAM
+  #
+  # 192 GB of total VRAM is still not enough to hold the model resident, so
+  # layerwise offload to host RAM is mandatory here too.
+  #
+  # g6e.12xlarge (4x L40S, sm_89) is deliberately excluded even though it has the
+  # same 192 GB of aggregate VRAM: this stack serves the Ref2VA partition, and
+  # Ref2VA denoises to snow/noise on every run on compute capability 8.9 --
+  # https://github.com/sgl-project/sglang/issues/34110. A ~$13/h box that
+  # reliably produces garbage is worse than no capacity at all.
   #
   # g5 is deliberately absent: 24 GB A10G cards are far too small per device and
   # the offload recipe would have to be rediscovered from scratch.
-  h3_capable_instance_types = ["g6e.12xlarge", "g7e.12xlarge"]
+  h3_capable_instance_types = ["g7e.12xlarge"]
 
-  # H3 is the only workload with a genuinely interchangeable second option, and
-  # capacity for *either* of them is the entire reason this deployment uses an
-  # Auto Scaling group instead of a single aws_instance.
+  # With a single H3-capable shape there is no automatic second pool to fall back
+  # to; set instance_type_fallbacks explicitly if you ever add one.
   default_instance_type_fallbacks = var.enable_h3 ? [
     for t in local.h3_capable_instance_types : t if t != var.instance_type
   ] : []

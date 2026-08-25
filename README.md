@@ -234,8 +234,8 @@ scripts/
   provision_vibevoice_tts_stack.sh  Python venv + VibeVoice-1.5B (community fork) multi-speaker podcast UI (port 7861)
   provision_vibevoice_stack.sh  Python venv + VibeVoice-Realtime-0.5B + web UI (disabled by default, port 7862)
   provision_asr_stack.sh        Python venv + Whisper/Granite speech-to-text UI (port 7864)
-  provision_h3_stack.sh         NVMe scratch+swap, FL2VA/Ref2VA checkpoint, pinned SGLang container (port 30010)
-  provision_h3_ui_stack.sh      Gradio wrapper around the async video API (port 7865)
+  provision_h3_stack.sh         NVMe scratch+swap, Ref2VA checkpoint, pinned SGLang container (port 30010)
+  provision_h3_ui_stack.sh      Gradio wrapper around the async video API: image reference in, MP4 out (port 7865)
   provision_autostop.sh         Hard-TTL and idle-stop systemd timers (all workloads)
   provision_landing_stack.sh    nginx + service portal listing the stacks that were installed (port 80)
 
@@ -394,7 +394,7 @@ Provisioning takes **15–25 minutes** on a `g5.xlarge` (large Python packages +
 | Open WebUI | `http://<EIP>:3000` | LLM chat, model management |
 | Gradio TTS UI | `http://<EIP>:7860` | 3-tab TTS: Kokoro / XTTS-v2 / Piper |
 | VibeVoice TTS UI | `http://<EIP>:7861` | Multi-speaker (1.5B), long-form conversational synthesis |
-| MiniMax-H3 UI | `http://<EIP>:7865` | Text → video + audio (`minimax-h3` workload) |
+| MiniMax-H3 UI | `http://<EIP>:7865` | Image reference → video + audio (`minimax-h3` workload) |
 | MiniMax-H3 API | `http://<EIP>:30010` | Async video API — see below |
 | Ollama API | `http://<EIP>:11434` | REST API, restricted to your IP — **no auth, anyone on that IP can use the GPU** |
 
@@ -412,22 +412,24 @@ curl http://localhost:11434/api/tags
 
 ---
 
-## MiniMax-H3 — video + audio generation
+## MiniMax-H3 — image reference → video + audio
 
 [MiniMax-H3](https://github.com/MiniMax-AI/MiniMax-H3) is a 33B dense flow-matching diffusion transformer that denoises **joint video and audio latents**: one request returns an H.264 MP4 (24 fps) with a synchronized stereo AAC track (32 kHz), 4–15 seconds long, up to 2K. It is served here by [SGLang-Diffusion](https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3).
+
+This stack serves the **Ref2VA** checkpoint partition only — `task: "ref2va"`, driven by an **image reference** plus a prompt.
 
 ```
                     Internet
                        │  your IP /32 only
                   Security Group
                        │
-              EC2 g6e.12xlarge · 4× L40S 48 GB · 384 GiB RAM
+           EC2 g7e.12xlarge · 2× RTX PRO 6000 96 GB · 512 GiB RAM
                        │
         ┌──────────────┼──────────────┬───────────────┐
      Netdata      Gradio UI       SGLang          NVMe scratch
       :19999        :7865          :30010          + 256 GiB swap
                        └──────────────┤
-                                 MiniMax-H3 (FL2VA / Ref2VA)
+                                 MiniMax-H3 (Ref2VA)
                                       │
                                   /v1/videos → MP4 + audio
 ```
@@ -441,49 +443,55 @@ curl http://localhost:11434/api/tags
 | Generation time | **~8–15 min for a 5 s clip** ⇒ roughly **$2–3 per video** |
 | Restart from stopped | Weights re-read from EBS, plus offload setup — minutes, not seconds |
 
-The generation estimate is extrapolated, not measured on this exact box: the closest published datapoint is 559 s (~9.3 min) for a 1344×768 / 124-frame / 50-step clip on 2× RTX 5090 with layerwise offload. **L40S has no NVLink**, so parallelism crosses PCIe and the H100/H200 numbers in the SGLang cookbook do not transfer. Measure it on your first run and replace this paragraph.
+The generation estimate is extrapolated, not measured on this exact box: the closest published datapoint is 559 s (~9.3 min) for a 1344×768 / 124-frame / 50-step clip on 2× RTX 5090 with layerwise offload. Measure it on your first run and replace this paragraph.
 
-### Choosing a checkpoint partition
+### Why the instance type is pinned to g7e.12xlarge
 
-H3 splits its capabilities across two checkpoint partitions, and one SGLang server can only mount one of them:
+H3 splits its capabilities across two checkpoint partitions and one SGLang server can only mount one of them. This lab mounts `ref2va`:
 
-| `h3_variant` | Tasks served | Conditioning |
+| Partition | Tasks served | Conditioning | Downloaded here |
+|---|---|---|---|
+| `Ref2VA` | `ref2va` | image, video and audio references | ✅ ~144 GB |
+| `FL2VA` | `t2va`, `fl2va` | none, or a first frame, a last frame, or both | ❌ |
+
+> On compute capability 8.9 — the 4× L40S `g6e.12xlarge` shape — `ref2va` produces snow/noise on **every** run, while `fl2va` is healthy on the identical box ([sgl-project/sglang#34110](https://github.com/sgl-project/sglang/issues/34110)). Since `fl2va` is not the mode this lab wants, `g6e.12xlarge` is excluded from `h3_capable_instance_types` and `terraform plan` rejects it. The RTX PRO 6000 Blackwell (`g7e.12xlarge`, sm_120) is unaffected. The provisioner repeats the check at boot and aborts **before** the 144 GB download if it somehow lands on an sm_89 card.
+
+The Hugging Face repo is **~498 GB in total** because it ships four overlapping things: a self-contained FL2VA pipeline (144 GB), a self-contained Ref2VA pipeline (144 GB), and a parallel root-level diffusers layout (~210 GB). This stack fetches **only the Ref2VA partition plus the small root metadata**, so `root_volume_size >= 300` is enough — enforced as a `terraform plan` precondition.
+
+### Reference images
+
+`conditions[].uri` must be a `file://` path the **SGLang container** can read, so the provisioner bind-mounts a host directory into it:
+
+| Host | Container | Written by |
 |---|---|---|
-| `fl2va` (default) | `t2va`, `fl2va` | none, or a first frame, a last frame, or both |
-| `ref2va` | `ref2va` | image, video and audio references |
-| `both` | either, one at a time | downloads ~288 GB and lets you switch without re-downloading |
+| `/opt/h3/media` | `/data/minimax-h3` (read-only) | the Gradio UI, on every upload |
 
-Switch the **served** partition on a running box without touching code:
-
-```bash
-sudo sed -i 's/^H3_MODEL_VARIANT=.*/H3_MODEL_VARIANT=ref2va/' /etc/llm-lab-h3.env
-sudo systemctl restart sglang-h3
-docker inspect sglang-h3 --format '{{json .Config.Cmd}}' | jq   # must show --model-variant ref2va
-```
-
-The launcher refuses to start if that partition's weights are not on disk, naming the command that downloads them, instead of letting SGLang fail with a bare `no safetensors files found`.
-
-> **`ref2va` on L40S**: on compute capability 8.9 (the 4× L40S `g6e.12xlarge` shape) `ref2va` produces snow/noise on every run while `fl2va` is healthy on the identical box — [sgl-project/sglang#34110](https://github.com/sgl-project/sglang/issues/34110). The provisioner warns when it detects that combination. The RTX PRO 6000 Blackwell (`g7e.12xlarge`, sm_120) is not affected.
-
-The Hugging Face repo is **~498 GB in total** because it ships four overlapping things: a self-contained FL2VA pipeline (144 GB), a self-contained Ref2VA pipeline (144 GB), and a parallel root-level diffusers layout (~210 GB). This stack fetches **only the requested partition(s) plus the small root metadata**, never the diffusers layout. `h3_variant = "both"` therefore needs `root_volume_size >= 500`, enforced as a `terraform plan` precondition.
+Drop files there yourself to reference them from `curl`. The image is *semantic reference material*, not a pixel-aligned first frame — H3 may recompose or crop it. Condition order is semantic too: the prompt refers to the first image as `<Picture 1>`, and the UI prepends a default sentence containing that tag if your prompt omits it.
 
 ### Using the API
 
 The API is **asynchronous — three calls**, not one:
 
 ```bash
+# 0. make the reference visible to the container
+sudo cp subject.png /opt/h3/media/
+
 # 1. submit
 ID=$(curl -sS http://<EIP>:30010/v1/videos \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "MiniMaxAI/MiniMax-H3",
-    "task": "t2va",
-    "prompt": "A futuristic data center at night, slow dolly shot, humming servers",
+    "task": "ref2va",
+    "prompt": "Use <Picture 1> as the visual subject; slow dolly shot at night, humming servers",
     "seconds": 5,
-    "conditions": [],
+    "conditions": [
+      {"type": "image", "uri": "file:///data/minimax-h3/subject.png", "role": "reference"}
+    ],
     "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5},
     "num_inference_steps": 50,
-    "seed": 1101
+    "flow_shift": 12.0,
+    "audio_flow_shift": 3.0,
+    "seed": 3101
   }' | jq -r '.id')
 
 # 2. poll until status is completed (this takes minutes)
@@ -493,27 +501,28 @@ watch -n 10 "curl -sS http://<EIP>:30010/v1/videos/$ID | jq '.status'"
 curl -sS -o out.mp4 "http://<EIP>:30010/v1/videos/$ID/content"
 ```
 
-The Gradio UI on `:7865` does all three for you and shows a progress bar.
+The Gradio UI on `:7865` does all of that for you and shows a progress bar.
 
 ### Storage layout
 
 | Path | Backing | Survives a stop? | Holds |
 |---|---|---|---|
-| `/opt/models/MiniMax-H3` | root gp3 EBS | ✅ yes | the ~144 GB checkpoint partition(s) |
+| `/opt/models/MiniMax-H3` | root gp3 EBS | ✅ yes | the ~144 GB Ref2VA checkpoint |
+| `/opt/h3/media` | root gp3 EBS | ✅ yes | uploaded reference images |
 | `/mnt/nvme/scratch` | instance store | ❌ wiped | temp files, HF metadata, intermediates |
 | `/mnt/nvme/swapfile` | instance store | ❌ recreated on boot | 256 GiB swap cushion |
 
 Instance storage is wiped on every stop, and the autostop guardrails stop this VM several times a day — so the checkpoint lives on EBS and only expendable data goes on NVMe. A `llm-lab-nvme-scratch.service` oneshot re-creates the filesystem, the mount and the swapfile on **every** boot, because cloud-init only runs once.
 
-The swap exists for a specific reason: layerwise offload streams the model through host RAM, and the reference recipe wants **~377 GiB** against this instance's **384 GiB** — a ~2 % margin. Swapping is slow; an OOM kill loses the whole run.
+The swap exists for a specific reason: layerwise offload streams the model through host RAM, and the reference recipe wants **~377 GiB**. Swapping is slow; an OOM kill loses the whole run.
 
 ### Tuning when it OOMs
 
-There is no published L40S profile — the SGLang cookbook covers H200, H100, B200, RTX 5090 and RTX 4090. The defaults here start from the 4-GPU datacenter recipe plus the offload flags from the verified memory-constrained one. If the server OOMs while loading weights, edit `/etc/llm-lab-h3.env` and walk down this ladder:
+There is no published RTX PRO 6000 profile — the SGLang cookbook covers H200, H100, B200, RTX 5090 and RTX 4090. The defaults here start from the verified 2× RTX 5090 layerwise-offload recipe, the closest memory-constrained shape. If the server OOMs while loading weights, edit `/etc/llm-lab-h3.env` and walk down this ladder:
 
 1. `H3_RESIDENT_LAYERS=0` — keep no DiT layers resident (slower, leanest)
 2. `H3_OFFLOAD_PREFETCH=0` — stop prefetching the next layer
-3. `H3_NUM_GPUS=2 H3_TP_SIZE=2 H3_ULYSSES=1 H3_DIT_CPU_OFFLOAD=true` — the exact shape reported working on 4× L40S in sglang#34110
+3. `H3_DIT_CPU_OFFLOAD=true` — full CPU offload of the transformer
 
 Then `sudo systemctl restart sglang-h3`. Whatever ends up working, commit it to the Terraform defaults so the next deploy does not rediscover it at $13/hour.
 

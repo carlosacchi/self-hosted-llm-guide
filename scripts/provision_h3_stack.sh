@@ -2,12 +2,17 @@
 set -euo pipefail
 
 ########################################
-# MiniMax-H3 stack provisioner (SGLang-Diffusion)
+# MiniMax-H3 stack provisioner (SGLang-Diffusion, Ref2VA)
 #
 # Serves MiniMax-H3 -- a 33B flow-matching diffusion transformer that denoises
 # joint video + audio latents -- behind SGLang's OpenAI-style video API on port
 # 30010. One request returns an H.264 MP4 (24 fps) with a synchronized stereo
 # AAC track. Clip length 4-15 seconds.
+#
+# This stack serves the Ref2VA checkpoint partition ONLY: `task: "ref2va"` with
+# image, video and audio references in `conditions`. The FL2VA partition (t2va
+# text-only + first/last-frame conditioning) is deliberately not downloaded --
+# it is another 144 GB for a mode this lab does not use.
 #
 # The API is ASYNCHRONOUS, three calls:
 #   POST /v1/videos                 -> {"id": ...}
@@ -15,46 +20,28 @@ set -euo pipefail
 #   GET  /v1/videos/{id}/content    -> the MP4 bytes
 # provision_h3_ui_stack.sh wraps that loop in a Gradio UI on port 7865.
 #
-# TARGET HARDWARE: an H3-capable GPU box, chosen at launch by the Auto Scaling
-# group from whichever pool has capacity:
+# Reference assets are passed as server-local file:// URIs, so they must be
+# visible INSIDE the container: H3_MEDIA_DIR on the host is bind-mounted
+# read-only at /data/minimax-h3, which is where the UI writes its uploads.
 #
-#   g6e.12xlarge   4x NVIDIA L40S 48 GB          48 vCPU, 384 GiB RAM, 3.8 TB NVMe
-#   g7e.12xlarge   2x NVIDIA RTX PRO 6000 96 GB  512 GiB RAM
-#
-# Two consequences drive everything below:
+# TARGET HARDWARE: g7e.12xlarge -- 2x NVIDIA RTX PRO 6000 96 GB (sm_120),
+# 512 GiB RAM. Two consequences drive everything below:
 #
 #   1. 192 GB of total VRAM is NOT enough to hold H3 resident -- the published
 #      datacenter recipes peak at 50-94 GB per GPU. Layerwise offload to host
-#      RAM is mandatory (--performance-mode memory) on either shape.
+#      RAM is mandatory (--performance-mode memory).
 #   2. That makes HOST RAM the binding constraint, not VRAM. The reference
-#      offload recipe (2x RTX 5090) needs ~377 GiB of host RAM; g6e.12xlarge has
-#      384 GiB, a ~2% margin. We add a large NVMe-backed swapfile as the
-#      cushion, because swapping is slow but an OOM kill costs a whole run.
+#      offload recipe (2x RTX 5090) needs ~377 GiB of host RAM. We add a large
+#      NVMe-backed swapfile as the cushion, because swapping is slow but an OOM
+#      kill costs a whole run.
 #
-# L40S is also NVLink-less: tensor/sequence parallelism crosses PCIe, so the
-# H100/H200 timings in the SGLang cookbook do not transfer. Expect minutes, not
-# seconds, per clip.
-#
-# H3 ships its capabilities in TWO checkpoint partitions, and one server can
-# only mount one of them:
-#
-#   fl2va   t2va (text only) + first/last-frame conditioning
-#   ref2va  reference-to-video: image, video and audio references
-#
-# H3_VARIANT selects what gets DOWNLOADED (fl2va, ref2va, or both at ~144 GB
-# each); H3_MODEL_VARIANT in /etc/llm-lab-h3.env selects what gets SERVED and is
-# switchable with a service restart once the weights are on disk.
-#
-# Known issue: ref2va produces snow/noise on compute-capability 8.9 cards (L40S,
-# i.e. g6e.12xlarge) while fl2va is healthy on the same box --
-# https://github.com/sgl-project/sglang/issues/34110 -- so this script warns
-# when the two are combined. RTX PRO 6000 Blackwell (sm_120, g7e.12xlarge) is
-# not affected.
+# g6e.12xlarge (4x L40S, sm_89) is NOT supported and this script refuses to run
+# on it: Ref2VA denoises to snow/noise on every run on compute capability 8.9 --
+# https://github.com/sgl-project/sglang/issues/34110 -- and failing before the
+# 144 GB download is far cheaper than discovering it after one generation.
 #
 # Usage:
 #   sudo bash provision_h3_stack.sh
-#   sudo H3_VARIANT=ref2va bash provision_h3_stack.sh
-#   sudo H3_VARIANT=both H3_MODEL_VARIANT=ref2va bash provision_h3_stack.sh
 ########################################
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,14 +52,8 @@ H3_PORT="${H3_PORT:-30010}"
 H3_SGLANG_IMAGE="${H3_SGLANG_IMAGE:-lmsysorg/sglang:v0.5.17-cu129}"
 H3_REPO_ID="${H3_REPO_ID:-MiniMaxAI/MiniMax-H3}"
 
-# Which partition(s) to download: fl2va, ref2va, or both.
-H3_VARIANT="${H3_VARIANT:-fl2va}"
-H3_VARIANT="${H3_VARIANT,,}"
-
-# Which partition the service mounts. Defaults to the downloaded one; with
-# H3_VARIANT=both it defaults to fl2va and is flipped later by editing
-# /etc/llm-lab-h3.env.
-H3_MODEL_VARIANT="${H3_MODEL_VARIANT:-}"
+# SGLang resolves --model-variant ref2va to this capitalised partition directory.
+H3_PARTITION_DIR="Ref2VA"
 
 # Model cache lives on the ROOT EBS VOLUME, never on the instance store: the
 # autostop guardrails stop this VM several times a day and instance storage is
@@ -81,6 +62,12 @@ H3_MODEL_VARIANT="${H3_MODEL_VARIANT:-}"
 H3_MODEL_ROOT="${H3_MODEL_ROOT:-/opt/models}"
 H3_MODEL_DIR="${H3_MODEL_DIR:-${H3_MODEL_ROOT}/MiniMax-H3}"
 
+# Reference images/audio/video uploaded by the UI. Bind-mounted read-only into
+# the container at /data/minimax-h3; on EBS so uploads survive an autostop.
+H3_MEDIA_DIR="${H3_MEDIA_DIR:-${H3_DIR}/media}"
+H3_MEDIA_MOUNT="/data/minimax-h3"
+H3_MEDIA_OWNER="${H3_MEDIA_OWNER:-ubuntu:ubuntu}"
+
 # Instance-store NVMe: scratch space and swap. Both are expendable across stops.
 NVME_MOUNT="${NVME_MOUNT:-/mnt/nvme}"
 NVME_SCRATCH="${NVME_MOUNT}/scratch"
@@ -88,17 +75,11 @@ SWAP_GIB="${SWAP_GIB:-256}"
 
 MIN_RAM_GB="${MIN_RAM_GB:-350}"
 
-# Which GPU topologies this script knows how to configure. The Auto Scaling
-# group picks whichever H3-capable shape has capacity, so the count is not known
-# until boot:
-#
-#   4 GPUs  g6e.12xlarge   4x L40S 48 GB          384 GiB RAM
-#   2 GPUs  g7e.12xlarge   2x RTX PRO 6000 96 GB  512 GiB RAM
-#
-# Both total 192 GB of VRAM, neither can hold H3 resident, and the parallelism
-# flags differ. DETECTED_GPUS is filled in by preflight and consumed when the
-# systemd unit is written.
-SUPPORTED_GPU_COUNTS="${SUPPORTED_GPU_COUNTS:-2 4}"
+# g7e.12xlarge has 2 GPUs, and the parallelism flags below assume it. Set
+# H3_ALLOW_ANY_GPU=true plus H3_NUM_GPUS/H3_TP_SIZE/H3_ULYSSES to run anywhere
+# else. DETECTED_GPUS is filled in by preflight and consumed when the systemd
+# unit is written.
+SUPPORTED_GPU_COUNTS="${SUPPORTED_GPU_COUNTS:-2}"
 DETECTED_GPUS=0
 
 log() {
@@ -112,63 +93,17 @@ require_root() {
   fi
 }
 
-# SGLang resolves --model-variant to a capitalised partition directory.
-partition_dir() {
-  case "$1" in
-    fl2va)  echo "FL2VA" ;;
-    ref2va) echo "Ref2VA" ;;
-    *)      return 1 ;;
-  esac
-}
-
-# Resolve H3_VARIANT / H3_MODEL_VARIANT into DOWNLOAD_VARIANTS + SERVE_VARIANT,
-# and size the disk check accordingly. Runs before anything expensive.
-resolve_variants() {
-  case "${H3_VARIANT}" in
-    fl2va|ref2va) DOWNLOAD_VARIANTS=("${H3_VARIANT}") ;;
-    both)         DOWNLOAD_VARIANTS=(fl2va ref2va) ;;
-    *)
-      log "FATAL: H3_VARIANT='${H3_VARIANT}' is not supported. Use fl2va, ref2va or both."
-      exit 1
-      ;;
-  esac
-
-  SERVE_VARIANT="${H3_MODEL_VARIANT,,}"
-  SERVE_VARIANT="${SERVE_VARIANT:-${DOWNLOAD_VARIANTS[0]}}"
-
-  if ! partition_dir "${SERVE_VARIANT}" >/dev/null; then
-    log "FATAL: H3_MODEL_VARIANT='${SERVE_VARIANT}' is not supported. Use fl2va or ref2va."
-    exit 1
-  fi
-
-  # Serving a partition that was never downloaded is the exact failure the
-  # runtime guard reports as "no safetensors files found"; catch it here instead.
-  local wanted
-  for wanted in "${DOWNLOAD_VARIANTS[@]}"; do
-    [[ "${wanted}" == "${SERVE_VARIANT}" ]] && return 0
-  done
-  log "FATAL: H3_MODEL_VARIANT='${SERVE_VARIANT}' is not among the downloaded partitions (${DOWNLOAD_VARIANTS[*]})."
-  log "       Use H3_VARIANT=${SERVE_VARIANT}, or H3_VARIANT=both to keep both on disk."
-  exit 1
-}
-
 has_partition_weights() {
-  compgen -G "${H3_MODEL_DIR}/$(partition_dir "$1")/transformer/*.safetensors" >/dev/null
+  compgen -G "${H3_MODEL_DIR}/${H3_PARTITION_DIR}/transformer/*.safetensors" >/dev/null
 }
 
-# Only partitions that are NOT already on disk need room. Adding ref2va next to
-# an existing fl2va must not be rejected for the space fl2va already occupies.
-count_missing_variants() {
-  local variant count=0
-  for variant in "${DOWNLOAD_VARIANTS[@]}"; do
-    has_partition_weights "${variant}" || count=$((count + 1))
-  done
-  echo "${count}"
-}
-
-# Each partition is ~144 GB; the rest covers the SGLang image, CUDA layers and
-# generated MP4s.
-MIN_FREE_GB="${MIN_FREE_GB:-}"
+# The partition is ~144 GB; the rest covers the SGLang image, CUDA layers and
+# generated MP4s. Weights already on disk do not need to be paid for again.
+if has_partition_weights; then
+  MIN_FREE_GB="${MIN_FREE_GB:-40}"
+else
+  MIN_FREE_GB="${MIN_FREE_GB:-190}"
+fi
 
 # shellcheck source=lib_docker_gpu.sh
 source "${HERE}/lib_docker_gpu.sh"
@@ -198,12 +133,16 @@ preflight() {
     log "    ${line}"
   done
 
-  # sglang#34110: ref2va denoises to snow on compute capability 8.9 (L40S).
-  if [[ "${SERVE_VARIANT}" == "ref2va" ]] &&
-     nvidia-smi --query-gpu=compute_cap --format=csv,noheader | grep -q '^8\.9$'; then
-    log "  WARNING: serving ref2va on a compute-capability 8.9 GPU (L40S)."
-    log "           https://github.com/sgl-project/sglang/issues/34110 reports snow/noise"
-    log "           output for that combination; fl2va is healthy on the same card."
+  # sglang#34110: Ref2VA denoises to snow on compute capability 8.9 (L40S).
+  # Fatal, not a warning -- this stack has no other partition to fall back to,
+  # and the check costs nothing while the download it prevents costs ~$4.
+  if nvidia-smi --query-gpu=compute_cap --format=csv,noheader | grep -q '^8\.9$'; then
+    log "FATAL: compute-capability 8.9 GPU detected (L40S, i.e. g6e.12xlarge)."
+    log "       Ref2VA produces snow/noise on EVERY run on that card --"
+    log "       https://github.com/sgl-project/sglang/issues/34110 -- so this"
+    log "       box would bill ~\$13/h to generate garbage. Relaunch on"
+    log "       g7e.12xlarge (RTX PRO 6000 Blackwell, sm_120)."
+    exit 1
   fi
 
   if ! grep -qw "${gpu_count}" <<<"${SUPPORTED_GPU_COUNTS}"; then
@@ -212,10 +151,10 @@ preflight() {
       log "           (known: ${SUPPORTED_GPU_COUNTS}). Continuing because H3_ALLOW_ANY_GPU=true."
       log "           Set H3_NUM_GPUS/H3_TP_SIZE/H3_ULYSSES yourself."
     else
-      log "FATAL: found ${gpu_count} GPUs; known topologies are ${SUPPORTED_GPU_COUNTS}"
-      log "       (4 = g6e.12xlarge, 2 = g7e.12xlarge). The launch flags depend on"
-      log "       this. Set H3_ALLOW_ANY_GPU=true and adjust"
-      log "       H3_NUM_GPUS/H3_TP_SIZE/H3_ULYSSES if you really mean it."
+      log "FATAL: found ${gpu_count} GPUs; the supported topology is ${SUPPORTED_GPU_COUNTS}"
+      log "       (g7e.12xlarge). The launch flags depend on this. Set"
+      log "       H3_ALLOW_ANY_GPU=true and adjust H3_NUM_GPUS/H3_TP_SIZE/H3_ULYSSES"
+      log "       if you really mean it."
       exit 1
     fi
   fi
@@ -226,16 +165,16 @@ preflight() {
   if [[ "${ram_gb}" -lt "${MIN_RAM_GB}" ]]; then
     log "FATAL: only ${ram_gb} GiB of host RAM, need at least ${MIN_RAM_GB}."
     log "       Layerwise offload streams the model through host RAM; the"
-    log "       reference recipe wants ~377 GiB. Use g6e.12xlarge or larger."
+    log "       reference recipe wants ~377 GiB. Use g7e.12xlarge (512 GiB)."
     exit 1
   fi
 
   local free_gb
   free_gb="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
-  log "  Free space on /: ${free_gb} GB (need ${MIN_FREE_GB} for ${MISSING_VARIANTS} partition(s) still to download)"
+  log "  Free space on /: ${free_gb} GB (need ${MIN_FREE_GB})"
   if [[ "${free_gb}" -lt "${MIN_FREE_GB}" ]]; then
     log "FATAL: only ${free_gb} GB free on /, need at least ${MIN_FREE_GB}."
-    log "       Each partition is ~144 GB. Raise root_volume_size (Terraform) and redeploy."
+    log "       The Ref2VA partition is ~144 GB. Raise root_volume_size (Terraform) and redeploy."
     exit 1
   fi
 
@@ -380,14 +319,14 @@ EOF
 }
 
 ########################################
-# Step 3: download the selected partition(s)
+# Step 3: download the Ref2VA partition
 #
 # The HF repo is ~498 GB in total because it ships FOUR overlapping things:
 # a self-contained FL2VA pipeline (144 GB), a self-contained Ref2VA pipeline
 # (144 GB), and a parallel root-level diffusers layout (transformer,
 # transformer_ref, text_encoder, vae ~210 GB). SGLang's --model-variant selects
-# a partition subdirectory, so we fetch only the requested partition(s) plus the
-# small root metadata and skip the parallel diffusers layout entirely.
+# a partition subdirectory, so we fetch only Ref2VA plus the small root metadata
+# and skip both FL2VA and the parallel diffusers layout entirely.
 ########################################
 
 create_download_venv() {
@@ -407,26 +346,23 @@ create_download_venv() {
 }
 
 download_model() {
-  log "Downloading ${H3_REPO_ID} partition(s) '${DOWNLOAD_VARIANTS[*]}' into ${H3_MODEL_DIR} ..."
-  log "  ~144 GB each. Expect ~3 min at 1000 MiB/s gp3 throughput, ~19 min at the 125 MiB/s default."
+  log "Downloading ${H3_REPO_ID} partition '${H3_PARTITION_DIR}' into ${H3_MODEL_DIR} ..."
+  log "  ~144 GB. Expect ~3 min at 1000 MiB/s gp3 throughput, ~19 min at the 125 MiB/s default."
   mkdir -p "${H3_MODEL_DIR}"
 
   HF_XET_HIGH_PERFORMANCE=1 \
   H3_REPO_ID="${H3_REPO_ID}" \
   H3_MODEL_DIR="${H3_MODEL_DIR}" \
-  H3_DOWNLOAD_VARIANTS="${DOWNLOAD_VARIANTS[*]}" \
+  H3_PARTITION_DIR="${H3_PARTITION_DIR}" \
   "${H3_DIR}/.venv/bin/python" - <<'PY'
 import os
 from huggingface_hub import snapshot_download
 
 repo = os.environ["H3_REPO_ID"]
 dest = os.environ["H3_MODEL_DIR"]
-# SGLang resolves --model-variant to a capitalised partition directory.
-partition_dirs = {"fl2va": "FL2VA", "ref2va": "Ref2VA"}
+partition = os.environ["H3_PARTITION_DIR"]
 
-patterns = ["*.json", "LICENSE", "README.md"]
-for variant in os.environ["H3_DOWNLOAD_VARIANTS"].split():
-    patterns.append(f"{partition_dirs[variant]}/**")
+patterns = ["*.json", "LICENSE", "README.md", f"{partition}/**"]
 
 # local_dir gives a plain directory tree (no blobs/ + symlink cache), so the
 # container mount is a single physical copy and `du` tells the truth.
@@ -439,19 +375,22 @@ path = snapshot_download(
 print("Downloaded to:", path)
 PY
 
-  local variant dir
-  for variant in "${DOWNLOAD_VARIANTS[@]}"; do
-    dir="${H3_MODEL_DIR}/$(partition_dir "${variant}")"
-    # snapshot_download exits 0 on an allow_patterns typo that matched nothing,
-    # and SGLang then reports a bare "no safetensors files found" at startup.
-    if ! compgen -G "${dir}/transformer/*.safetensors" >/dev/null; then
-      log "FATAL: no .safetensors in ${dir}/transformer after download."
-      log "       The '${variant}' partition did not land. Check the log above for HTTP or disk errors."
-      exit 1
-    fi
-    log "  ${variant}: $(du -sh "${dir}" | cut -f1) at ${dir}"
-  done
-  log "Checkpoint on disk: $(du -sh "${H3_MODEL_DIR}" | cut -f1) total"
+  local dir="${H3_MODEL_DIR}/${H3_PARTITION_DIR}"
+  # snapshot_download exits 0 on an allow_patterns typo that matched nothing,
+  # and SGLang then reports a bare "no safetensors files found" at startup.
+  if ! compgen -G "${dir}/transformer/*.safetensors" >/dev/null; then
+    log "FATAL: no .safetensors in ${dir}/transformer after download."
+    log "       The Ref2VA partition did not land. Check the log above for HTTP or disk errors."
+    exit 1
+  fi
+  log "Checkpoint on disk: $(du -sh "${dir}" | cut -f1) at ${dir}"
+}
+
+# Reference assets must be readable INSIDE the container, so the UI and the
+# server agree on one host directory bind-mounted at ${H3_MEDIA_MOUNT}.
+create_media_dir() {
+  log "Creating reference-media directory ${H3_MEDIA_DIR} ..."
+  install -d -m 0755 -o "${H3_MEDIA_OWNER%%:*}" -g "${H3_MEDIA_OWNER##*:}" "${H3_MEDIA_DIR}"
 }
 
 ########################################
@@ -478,38 +417,28 @@ install_systemd_service() {
 
   # Parallelism / offload knobs, overridable without editing the unit.
   #
-  # There is no published L40S or RTX PRO 6000 profile: the SGLang cookbook
-  # covers H200, H100, B200, RTX 5090 and RTX 4090. These values start from the
-  # 4-GPU datacenter recipe and add the offload flags from the verified
-  # memory-constrained one. Ulysses sequence parallelism is only worth paying
-  # for when there are more GPUs than the tensor-parallel degree, so the 2-GPU
-  # shape drops it to 1.
+  # There is no published RTX PRO 6000 profile: the SGLang cookbook covers H200,
+  # H100, B200, RTX 5090 and RTX 4090. These values start from the 2-GPU RTX
+  # 5090 offload recipe, which is the closest verified memory-constrained shape.
+  # Ulysses sequence parallelism is only worth paying for when there are more
+  # GPUs than the tensor-parallel degree, so it stays at 1 here.
   #
   # If the server OOMs during weight loading, walk DOWN this ladder in order:
   #
   #   1. H3_RESIDENT_LAYERS=0        keep no DiT layers resident (slower, leanest)
   #   2. H3_OFFLOAD_PREFETCH=0       stop prefetching the next layer
-  #   3. H3_NUM_GPUS=2 H3_TP_SIZE=2 H3_ULYSSES=1 with H3_DIT_CPU_OFFLOAD=true
-  #      -- the exact shape reported working on 4x L40S in sglang#34110
+  #   3. H3_DIT_CPU_OFFLOAD=true     full CPU offload of the transformer
   #
   # Whatever ends up working, write it into the Terraform defaults so the next
   # deploy does not re-discover it at $13/hour.
-  local default_ulysses=1
-  if [[ "${DETECTED_GPUS}" -ge 4 ]]; then
-    default_ulysses=2
-  fi
 
   cat > /etc/llm-lab-h3.env <<EOF
-# Checkpoint partition to serve. Switch it here and restart the service:
-#   fl2va   t2va (text only) + first/last-frame conditioning
-#   ref2va  image / video / audio reference conditioning
-# The weights must already be on disk; provision them with
-#   sudo H3_VARIANT=<variant> bash provision_h3_stack.sh
-H3_MODEL_VARIANT=${SERVE_VARIANT}
-
+# Serving the Ref2VA checkpoint partition: task "ref2va" with image, video and
+# audio references. The FL2VA partition (t2va / first-and-last-frame) is not on
+# disk and this stack does not download it.
 H3_NUM_GPUS=${H3_NUM_GPUS:-${DETECTED_GPUS}}
 H3_TP_SIZE=${H3_TP_SIZE:-2}
-H3_ULYSSES=${H3_ULYSSES:-${default_ulysses}}
+H3_ULYSSES=${H3_ULYSSES:-1}
 H3_PERFORMANCE_MODE=${H3_PERFORMANCE_MODE:-memory}
 H3_RESIDENT_LAYERS=${H3_RESIDENT_LAYERS:-20}
 H3_OFFLOAD_PREFETCH=${H3_OFFLOAD_PREFETCH:-1}
@@ -523,24 +452,11 @@ set -euo pipefail
 # shellcheck disable=SC1091
 source /etc/llm-lab-h3.env
 
-# The served partition is a runtime setting, NOT baked into this script: edit
-# H3_MODEL_VARIANT in /etc/llm-lab-h3.env and restart sglang-h3.
-variant="\${H3_MODEL_VARIANT:-fl2va}"
-variant="\${variant,,}"
-case "\${variant}" in
-  fl2va)  partition=FL2VA ;;
-  ref2va) partition=Ref2VA ;;
-  *)
-    echo "FATAL: H3_MODEL_VARIANT='\${variant}' is not supported (fl2va|ref2va)." >&2
-    exit 1
-    ;;
-esac
-
 # SGLang's own message for a missing partition is a bare "no safetensors files
-# found"; name the knob that actually needs changing instead.
-if ! compgen -G "${H3_MODEL_DIR}/\${partition}/transformer/*.safetensors" >/dev/null; then
-  echo "FATAL: \${partition} weights are not on disk at ${H3_MODEL_DIR}/\${partition}." >&2
-  echo "       Download them with: sudo H3_VARIANT=\${variant} bash provision_h3_stack.sh" >&2
+# found"; name the command that actually fixes it instead.
+if ! compgen -G "${H3_MODEL_DIR}/${H3_PARTITION_DIR}/transformer/*.safetensors" >/dev/null; then
+  echo "FATAL: ${H3_PARTITION_DIR} weights are not on disk at ${H3_MODEL_DIR}/${H3_PARTITION_DIR}." >&2
+  echo "       Download them with: sudo bash provision_h3_stack.sh" >&2
   exit 1
 fi
 
@@ -555,13 +471,14 @@ exec docker run --rm --name ${H3_NAME} \\
   --ulimit memlock=-1 --ulimit stack=67108864 \\
   -p ${H3_PORT}:${H3_PORT} \\
   -v ${H3_MODEL_DIR}:/models/MiniMax-H3 \\
+  -v ${H3_MEDIA_DIR}:${H3_MEDIA_MOUNT}:ro \\
   -v ${NVME_SCRATCH}:/scratch \\
   -e HF_HOME=/scratch/hf \\
   -e TMPDIR=/scratch/tmp \\
   ${H3_SGLANG_IMAGE} \\
   sglang serve \\
     --model-path /models/MiniMax-H3 \\
-    --model-variant "\${variant}" \\
+    --model-variant ref2va \\
     --num-gpus "\${H3_NUM_GPUS}" \\
     --tp-size "\${H3_TP_SIZE}" \\
     --ulysses-degree "\${H3_ULYSSES}" \\
@@ -652,13 +569,11 @@ wait_for_ready() {
 
 main() {
   require_root
-  resolve_variants
 
-  MISSING_VARIANTS="$(count_missing_variants)"
-  MIN_FREE_GB="${MIN_FREE_GB:-$(( 40 + 150 * MISSING_VARIANTS ))}"
-
-  log "Provisioning MiniMax-H3 (download=${DOWNLOAD_VARIANTS[*]}, serve=${SERVE_VARIANT}, image=${H3_SGLANG_IMAGE})"
-  log "  Partitions still to download: ${MISSING_VARIANTS} of ${#DOWNLOAD_VARIANTS[@]}"
+  log "Provisioning MiniMax-H3 (Ref2VA image/video/audio reference conditioning, image=${H3_SGLANG_IMAGE})"
+  if has_partition_weights; then
+    log "  Checkpoint already on disk; skipping the 144 GB download."
+  fi
 
   preflight
   install_system_deps
@@ -667,25 +582,26 @@ main() {
   install_nvme_scratch_unit
   create_download_venv
   download_model
+  create_media_dir
   pull_image
   install_systemd_service
   wait_for_ready
 
   log ""
   log "=== MiniMax-H3 stack ready ==="
-  log "  Model dir : ${H3_MODEL_DIR} (on disk: ${DOWNLOAD_VARIANTS[*]})"
-  log "  Serving   : ${SERVE_VARIANT} -> tasks $( [[ ${SERVE_VARIANT} == fl2va ]] && echo 't2va, fl2va' || echo 'ref2va' )"
+  log "  Model dir : ${H3_MODEL_DIR}/${H3_PARTITION_DIR}"
+  log "  Serving   : ref2va -> image / video / audio reference conditioning"
   log "  REST API  : http://<EIP>:${H3_PORT}/v1/videos"
+  log "  Media dir : ${H3_MEDIA_DIR} -> ${H3_MEDIA_MOUNT} in the container (reference uploads)"
   log "  Scratch   : ${NVME_SCRATCH} (instance store, wiped on stop)"
   log ""
   log "  Status    : sudo systemctl status ${H3_NAME}"
   log "  Logs      : sudo journalctl -fu ${H3_NAME}"
   log "  Tuning    : sudo nano /etc/llm-lab-h3.env && sudo systemctl restart ${H3_NAME}"
-  log "  Variant   : set H3_MODEL_VARIANT in /etc/llm-lab-h3.env, then restart the service"
   log ""
   log "  Reminder: this box bills at roughly \$13/hour. Generation is minutes per"
-  log "  clip on PCIe-connected L40S, so a single 5s video costs a couple of"
-  log "  dollars. The autostop timers are there for a reason - leave them on."
+  log "  clip, so a single 5s video costs a couple of dollars. The autostop timers"
+  log "  are there for a reason - leave them on."
 }
 
 main "$@"

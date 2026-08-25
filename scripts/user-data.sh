@@ -67,8 +67,6 @@ export ENABLE_VIBEVOICE_7B="${enable_vibevoice_7b}"
 export ENABLE_ASR="${enable_asr}"
 export ASR_MODEL="${asr_model}"
 export ENABLE_H3="${enable_h3}"
-export H3_VARIANT="${h3_variant}"
-export H3_MODEL_VARIANT="${h3_model_variant}"
 export H3_SGLANG_IMAGE="${h3_sglang_image}"
 # Cost guardrails installed for every workload (see provision_autostop.sh).
 export AUTO_STOP_HOURS="${auto_stop_hours}"

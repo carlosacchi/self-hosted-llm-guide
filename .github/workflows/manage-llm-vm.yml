@@ -11,7 +11,7 @@ on:
           - destroy
         default: apply
       instance_type:
-        description: "PREFERRED instance size -- the ASG falls back to the other H3-capable type if this pool is empty. g5.* = A10G 24 GB (~$1.2-$7/h). g6e.12xlarge (4x L40S) and g7e.12xlarge (2x RTX PRO 6000) are the two shapes the minimax-h3 workload accepts."
+        description: "Instance size. g5.* = A10G 24 GB (~$1.2-$7/h). g6e.12xlarge = 4x L40S. The minimax-h3 workload accepts ONLY g7e.12xlarge (2x RTX PRO 6000) -- ref2va renders noise on L40S, see sglang#34110."
         type: choice
         options:
           - g5.xlarge
@@ -45,7 +45,7 @@ on:
         description: "Single IPv4 address allowed to reach SSH/Web/FastAPI"
         required: true
       workload:
-        description: "What to run on the GPU. 'llm-lab' = Ollama + Open WebUI + TTS. 'speech-lab' = TTS only (pair with the vibevoice/asr pickers). 'minimax-h3' = MiniMax-H3 video+audio ALONE on the box; it needs g6e.12xlarge and disables every other stack."
+        description: "What to run on the GPU. 'llm-lab' = Ollama + Open WebUI + TTS. 'speech-lab' = TTS only (pair with the vibevoice/asr pickers). 'minimax-h3' = MiniMax-H3 image-reference video+audio ALONE on the box; it needs g7e.12xlarge and disables every other stack."
         type: choice
         options:
           - llm-lab
@@ -132,11 +132,11 @@ jobs:
       TF_VAR_enable_asr: ${{ inputs.workload != 'minimax-h3' && inputs.asr != 'none' }}
       TF_VAR_asr_model: ${{ inputs.asr == 'none' && 'whisper-large-v3' || inputs.asr }}
 
-      # H3 needs room for the 144 GB FL2VA partition plus the SGLang image, and
+      # H3 needs room for the 144 GB Ref2VA partition plus the SGLang image, and
       # gp3's default 125 MiB/s would spend ~19 minutes just writing those
       # weights (and re-reading them on every later boot). 1000 MiB/s cuts that
       # to a couple of minutes for a few dollars a month.
-      TF_VAR_root_volume_size: ${{ inputs.workload == 'minimax-h3' && '500' || '200' }}
+      TF_VAR_root_volume_size: ${{ inputs.workload == 'minimax-h3' && '350' || '200' }}
       TF_VAR_root_volume_throughput: ${{ inputs.workload == 'minimax-h3' && '1000' || '125' }}
 
       # Cost guardrails (see scripts/provision_autostop.sh).

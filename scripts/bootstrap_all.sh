@@ -15,10 +15,7 @@ set -euo pipefail
 #   ENABLE_VIBEVOICE_REALTIME  provision_vibevoice_stack.sh       (VibeVoice Realtime 0.5B, 7862)
 #   ENABLE_VIBEVOICE_7B        provision_vibevoice_tts_stack.sh   (VibeVoice 7B multi-speaker, 7863, ~16 GB VRAM)
 #   ENABLE_ASR + ASR_MODEL     provision_asr_stack.sh             (Speech-to-text: audio/video/YouTube -> text, 7864)
-#   ENABLE_H3 + H3_VARIANT     provision_h3_stack.sh              (MiniMax-H3 video+audio, 30010 + UI 7865)
-#                              H3_VARIANT selects the checkpoint partition(s) to
-#                              download: fl2va | ref2va | both. H3_MODEL_VARIANT
-#                              selects which one is served.
+#   ENABLE_H3                  provision_h3_stack.sh              (MiniMax-H3 image-reference video+audio, 30010 + UI 7865)
 #
 # The autostop guardrails (provision_autostop.sh) and the landing portal
 # (nginx, port 80) always run last. Defaults (when an env var is unset) match
@@ -29,10 +26,10 @@ set -euo pipefail
 # fits, or use a larger GPU.
 #
 # ENABLE_H3 is different in kind: MiniMax-H3 is a 33B flow-matching DiT that
-# needs all 4 L40S of a g6e.12xlarge plus most of the 384 GiB of host RAM for
-# layerwise offload. It is EXCLUSIVE - enabling it alongside any other GPU stack
-# is a hard error, not a warning, because on a ~$13/h box a bootstrap that OOMs
-# halfway through is money burned for nothing.
+# needs both RTX PRO 6000 cards of a g7e.12xlarge plus most of the 512 GiB of
+# host RAM for layerwise offload. It is EXCLUSIVE - enabling it alongside any
+# other GPU stack is a hard error, not a warning, because on a ~$13/h box a
+# bootstrap that OOMs halfway through is money burned for nothing.
 #
 # Intended to be invoked by cloud-init on first boot (see scripts/user-data.sh),
 # but can also be run by hand, optionally overriding flags:
@@ -59,10 +56,6 @@ ENABLE_VIBEVOICE_7B="${ENABLE_VIBEVOICE_7B:-false}"
 ENABLE_ASR="${ENABLE_ASR:-false}"
 ASR_MODEL="${ASR_MODEL:-whisper-large-v3}"
 ENABLE_H3="${ENABLE_H3:-false}"
-H3_VARIANT="${H3_VARIANT:-fl2va}"
-# Which downloaded partition the service mounts; defaults to H3_VARIANT unless
-# both were downloaded, where provision_h3_stack.sh falls back to fl2va.
-H3_MODEL_VARIANT="${H3_MODEL_VARIANT:-}"
 H3_SGLANG_IMAGE="${H3_SGLANG_IMAGE:-lmsysorg/sglang:v0.5.17-cu129}"
 
 # Cost guardrails (see provision_autostop.sh). Installed for every workload.
@@ -133,7 +126,7 @@ disable_unattended_upgrades() {
 
 disable_unattended_upgrades
 
-log "Selected stacks: monitoring=${ENABLE_MONITORING} llm=${ENABLE_LLM} tts=${ENABLE_TTS} vibevoice_1.5b=${ENABLE_VIBEVOICE_15B} vibevoice_realtime=${ENABLE_VIBEVOICE_REALTIME} vibevoice_7b=${ENABLE_VIBEVOICE_7B} asr=${ENABLE_ASR}(${ASR_MODEL}) h3=${ENABLE_H3}(${H3_VARIANT})"
+log "Selected stacks: monitoring=${ENABLE_MONITORING} llm=${ENABLE_LLM} tts=${ENABLE_TTS} vibevoice_1.5b=${ENABLE_VIBEVOICE_15B} vibevoice_realtime=${ENABLE_VIBEVOICE_REALTIME} vibevoice_7b=${ENABLE_VIBEVOICE_7B} asr=${ENABLE_ASR}(${ASR_MODEL}) h3=${ENABLE_H3}"
 log "Cost guardrails: hard TTL=${AUTO_STOP_HOURS}h idle stop=${IDLE_STOP_MINUTES}min (0 = disabled)"
 
 # Hard guard, not a warning. Terraform already blocks this combination in
@@ -150,17 +143,9 @@ if is_enabled "${ENABLE_H3}"; then
 
   if (( ${#conflicting[@]} > 0 )); then
     log "FATAL: ENABLE_H3=true cannot be combined with: ${conflicting[*]}"
-    log "       MiniMax-H3 needs all 4 GPUs and most of the host RAM for layerwise"
+    log "       MiniMax-H3 needs both GPUs and most of the host RAM for layerwise"
     log "       offload. Sharing the box guarantees an OOM partway through a costly"
     log "       boot. Disable the other stacks (monitoring may stay on) and re-run."
-    exit 1
-  fi
-
-  if ! [[ "${H3_VARIANT,,}" =~ ^(fl2va|ref2va|both)$ ]]; then
-    log "FATAL: H3_VARIANT='${H3_VARIANT}' is not supported; use fl2va, ref2va or both."
-    log "       fl2va serves t2va + first/last-frame conditioning, ref2va serves"
-    log "       image/video/audio reference conditioning, both keeps ~288 GB on disk"
-    log "       and lets you switch with H3_MODEL_VARIANT + a service restart."
     exit 1
   fi
 fi
@@ -224,9 +209,8 @@ else
 fi
 
 if is_enabled "${ENABLE_H3}"; then
-  log "=== MiniMax-H3 video+audio stack (SGLang REST 30010, download=${H3_VARIANT} serve=${H3_MODEL_VARIANT:-auto}) ==="
-  H3_VARIANT="${H3_VARIANT}" H3_MODEL_VARIANT="${H3_MODEL_VARIANT}" H3_SGLANG_IMAGE="${H3_SGLANG_IMAGE}" \
-    bash "${HERE}/provision_h3_stack.sh"
+  log "=== MiniMax-H3 image-reference video+audio stack (SGLang REST 30010, Ref2VA) ==="
+  H3_SGLANG_IMAGE="${H3_SGLANG_IMAGE}" bash "${HERE}/provision_h3_stack.sh"
 
   log "=== MiniMax-H3 Gradio UI (port 7865) ==="
   H3_UI_PORT=7865 bash "${HERE}/provision_h3_ui_stack.sh"

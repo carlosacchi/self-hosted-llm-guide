@@ -10,8 +10,14 @@ set -euo pipefail
 #   GET  /v1/videos/{id}/content -> MP4 bytes
 #
 # Every other tool in this lab (TTS, VibeVoice, ASR, Open WebUI) has a browser
-# UI indexed by the landing portal, so H3 gets one too: prompt in, MP4 player
-# out, with the polling loop hidden.
+# UI indexed by the landing portal, so H3 gets one too: reference image +
+# prompt in, MP4 player out, with the polling loop hidden.
+#
+# The backend serves the Ref2VA partition, so every request is task "ref2va"
+# with an image condition. Reference assets are passed as server-local file://
+# URIs, which means the upload has to land in the directory that
+# provision_h3_stack.sh bind-mounts read-only into the container: H3_MEDIA_DIR
+# on the host, /data/minimax-h3 inside it.
 #
 # Depends on provision_h3_stack.sh having installed the SGLang server. Talks to
 # it over localhost, so the UI works even before the server finishes loading
@@ -29,6 +35,11 @@ H3_UI_USER="${H3_UI_USER:-ubuntu}"
 H3_UI_GROUP="${H3_UI_GROUP:-ubuntu}"
 H3_API_BASE="${H3_API_BASE:-http://127.0.0.1:30010}"
 H3_MODEL_NAME="${H3_MODEL_NAME:-MiniMaxAI/MiniMax-H3}"
+
+# Must match provision_h3_stack.sh: host path and its mount point inside the
+# SGLang container. The UI writes uploads to the first and sends the second.
+H3_MEDIA_DIR="${H3_MEDIA_DIR:-/opt/h3/media}"
+H3_MEDIA_MOUNT="${H3_MEDIA_MOUNT:-/data/minimax-h3}"
 
 log() {
   echo -e "[provision_h3_ui_stack] $*"
@@ -72,17 +83,18 @@ write_app() {
   log "Writing app to ${H3_UI_DIR}/app.py ..."
 
   cat > "${H3_UI_DIR}/app.py" <<'PYTHON'
-"""Gradio front-end for the MiniMax-H3 SGLang video API.
+"""Gradio front-end for the MiniMax-H3 SGLang video API (Ref2VA).
 
 Wraps the asynchronous submit/poll/download flow so the browser gets a plain
-"type a prompt, watch a video" experience.
+"upload a reference image, type a prompt, watch a video" experience.
 
-Generation on 4x PCIe-connected L40S with layerwise offload takes MINUTES per
-clip, not seconds, so the UI streams progress updates instead of blocking on a
-silent request.
+Generation on 2x PCIe-connected RTX PRO 6000 with layerwise offload takes
+MINUTES per clip, not seconds, so the UI streams progress updates instead of
+blocking on a silent request.
 """
 
 import os
+import shutil
 import time
 import uuid
 
@@ -93,14 +105,23 @@ API_BASE = os.environ.get("H3_API_BASE", "http://127.0.0.1:30010").rstrip("/")
 MODEL_NAME = os.environ.get("H3_MODEL_NAME", "MiniMaxAI/MiniMax-H3")
 OUTPUT_DIR = os.environ.get("H3_UI_OUTPUT_DIR", "/opt/h3-ui/outputs")
 
+# Reference uploads are handed to SGLang as file:// URIs, so they must be
+# written where the container can read them: MEDIA_DIR on the host is the same
+# directory as MEDIA_MOUNT inside it.
+MEDIA_DIR = os.environ.get("H3_MEDIA_DIR", "/opt/h3/media")
+MEDIA_MOUNT = os.environ.get("H3_MEDIA_MOUNT", "/data/minimax-h3")
+
 # Generous: a 5s clip can legitimately take 15+ minutes on this hardware.
 POLL_TIMEOUT_S = int(os.environ.get("H3_POLL_TIMEOUT_S", "3600"))
 POLL_INTERVAL_S = 5
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4"]
+# Ref2VA resolves "auto" to the model's 16:9 fallback rather than inheriting the
+# reference image's geometry, so an explicit ratio is usually what you want.
+ASPECT_RATIOS = ["16:9", "9:16", "1:1", "4:3", "3:4", "auto"]
 SHORT_EDGES = [512, 768, 1024]
+ALLOWED_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def server_status() -> str:
@@ -117,18 +138,52 @@ def server_status() -> str:
         )
 
 
-def generate(prompt, seconds, short_edge, aspect_ratio, steps, seed, progress=gr.Progress()):
+def stage_reference(image_path: str) -> str:
+    """Copy an upload into the container-visible media dir, return its file:// URI."""
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext not in ALLOWED_IMAGE_EXT:
+        raise gr.Error(
+            f"Unsupported image type {ext or '(no extension)'}. "
+            f"Use one of: {', '.join(sorted(ALLOWED_IMAGE_EXT))}."
+        )
+
+    name = f"ref-{uuid.uuid4().hex}{ext}"
+    try:
+        shutil.copyfile(image_path, os.path.join(MEDIA_DIR, name))
+    except OSError as exc:
+        raise gr.Error(
+            f"Could not stage the reference image in {MEDIA_DIR}: {exc}. "
+            "That directory is created by provision_h3_stack.sh and must be "
+            "writable by this service."
+        ) from exc
+    return f"file://{MEDIA_MOUNT}/{name}"
+
+
+def generate(image_path, prompt, seconds, short_edge, aspect_ratio, steps, seed, progress=gr.Progress()):
+    if not image_path:
+        raise gr.Error("Upload a reference image first — this backend serves ref2va only.")
+
     prompt = (prompt or "").strip()
     if not prompt:
         raise gr.Error("Enter a prompt first.")
 
+    # Ref2VA condition order is semantic: the prompt refers to the first image
+    # condition as <Picture 1>. Without that tag the reference is ignored.
+    if "<Picture 1>" not in prompt:
+        prompt = f"Use <Picture 1> as the visual subject and style reference. {prompt}"
+
+    progress(0, desc="Staging reference image...")
+    reference_uri = stage_reference(image_path)
+
     seconds = int(seconds)
     payload = {
         "model": MODEL_NAME,
-        "task": "t2va",
+        "task": "ref2va",
         "prompt": prompt,
         "seconds": seconds,
-        "conditions": [],
+        "conditions": [
+            {"type": "image", "uri": reference_uri, "role": "reference"},
+        ],
         "target": {
             "short_edge": int(short_edge),
             "aspect_ratio": aspect_ratio,
@@ -136,10 +191,12 @@ def generate(prompt, seconds, short_edge, aspect_ratio, steps, seed, progress=gr
         },
         "num_outputs_per_prompt": 1,
         "num_inference_steps": int(steps),
+        "flow_shift": 12.0,
+        "audio_flow_shift": 3.0,
         "seed": int(seed),
     }
 
-    progress(0, desc="Submitting job...")
+    progress(0.02, desc="Submitting job...")
     try:
         r = requests.post(f"{API_BASE}/v1/videos", json=payload, timeout=30)
     except requests.RequestException as exc:
@@ -202,16 +259,18 @@ def generate(prompt, seconds, short_edge, aspect_ratio, steps, seed, progress=gr
     info = (
         f"Done in {total // 60}m {total % 60}s · job {job_id} · "
         f"{seconds}s @ {short_edge}p {aspect_ratio} · {int(steps)} steps · seed {int(seed)}\n"
+        f"Reference: {reference_uri}\n"
         f"Saved to {out_path}"
     )
     return out_path, info
 
 
-with gr.Blocks(title="MiniMax-H3 — video + audio") as demo:
-    gr.Markdown("# MiniMax-H3 — text to video *and* audio")
+with gr.Blocks(title="MiniMax-H3 — image reference to video + audio") as demo:
+    gr.Markdown("# MiniMax-H3 — image reference → video *and* audio")
     gr.Markdown(
-        "One request produces an H.264 MP4 with a synchronized stereo AAC track. "
-        "**Generation takes minutes, not seconds**: this box runs 4x L40S over PCIe "
+        "Upload a reference image, describe the scene, and one request produces an "
+        "H.264 MP4 with a synchronized stereo AAC track. "
+        "**Generation takes minutes, not seconds**: this box runs 2x RTX PRO 6000 "
         "with layerwise offload, so budget roughly 8-15 minutes for a 5-second clip. "
         "The instance bills at about $13/hour — the autostop timers will shut it "
         "down when idle."
@@ -220,9 +279,17 @@ with gr.Blocks(title="MiniMax-H3 — video + audio") as demo:
 
     with gr.Row():
         with gr.Column(scale=3):
+            reference = gr.Image(
+                label="Reference image (required)",
+                type="filepath",
+                sources=["upload", "clipboard"],
+            )
             prompt = gr.Textbox(
                 label="Prompt",
-                placeholder="A futuristic data center at night, slow dolly shot, humming servers",
+                placeholder=(
+                    "Use <Picture 1> as the visual subject; slow dolly shot at night, "
+                    "humming servers, shallow depth of field"
+                ),
                 lines=4,
             )
             with gr.Row():
@@ -231,25 +298,24 @@ with gr.Blocks(title="MiniMax-H3 — video + audio") as demo:
             with gr.Row():
                 short_edge = gr.Dropdown(SHORT_EDGES, value=768, label="Short edge (px)")
                 aspect_ratio = gr.Dropdown(ASPECT_RATIOS, value="16:9", label="Aspect ratio")
-                seed = gr.Number(value=1101, precision=0, label="Seed")
+                seed = gr.Number(value=3101, precision=0, label="Seed")
             go = gr.Button("Generate", variant="primary")
             refresh = gr.Button("Refresh server status", size="sm")
         with gr.Column(scale=2):
             video_out = gr.Video(label="Result", autoplay=False)
-            info_out = gr.Textbox(label="Details", lines=4, show_copy_button=True)
+            info_out = gr.Textbox(label="Details", lines=5, show_copy_button=True)
 
     gr.Markdown(
-        "This UI submits `t2va` (text-only) requests, served by the **fl2va** checkpoint "
-        "partition. The partition the backend mounts is set by `H3_MODEL_VARIANT` in "
-        "`/etc/llm-lab-h3.env` (`fl2va` for `t2va`/`fl2va`, `ref2va` for reference "
-        "conditioning); change it there and restart `sglang-h3`. Note that `ref2va` "
-        "produces noise on L40S-class GPUs "
-        "([sglang#34110](https://github.com/sgl-project/sglang/issues/34110))."
+        "This UI submits `ref2va` requests against the **Ref2VA** checkpoint partition — "
+        "the only one this stack downloads. The image is *semantic reference material*, "
+        "not a pixel-aligned first frame: H3 may recompose or crop it. Reference the "
+        "upload in the prompt as `<Picture 1>`; if you leave the tag out, the UI "
+        "prepends a default sentence that does."
     )
 
     go.click(
         generate,
-        inputs=[prompt, seconds, short_edge, aspect_ratio, steps, seed],
+        inputs=[reference, prompt, seconds, short_edge, aspect_ratio, steps, seed],
         outputs=[video_out, info_out],
     )
     refresh.click(lambda: server_status(), outputs=status_md)
@@ -273,6 +339,10 @@ install_systemd_service() {
   mkdir -p "${H3_UI_DIR}/outputs"
   chown -R "${H3_UI_USER}:${H3_UI_GROUP}" "${H3_UI_DIR}"
 
+  # provision_h3_stack.sh normally creates this; make it writable here too so a
+  # standalone UI re-run does not fail on the first upload.
+  install -d -m 0755 -o "${H3_UI_USER}" -g "${H3_UI_GROUP}" "${H3_MEDIA_DIR}"
+
   cat > "/etc/systemd/system/${H3_UI_NAME}.service" <<EOF
 [Unit]
 Description=MiniMax-H3 video generation UI (Gradio)
@@ -286,6 +356,8 @@ Environment=H3_API_BASE=${H3_API_BASE}
 Environment=H3_MODEL_NAME=${H3_MODEL_NAME}
 Environment=H3_UI_PORT=${H3_UI_PORT}
 Environment=H3_UI_OUTPUT_DIR=${H3_UI_DIR}/outputs
+Environment=H3_MEDIA_DIR=${H3_MEDIA_DIR}
+Environment=H3_MEDIA_MOUNT=${H3_MEDIA_MOUNT}
 ExecStart=${H3_UI_DIR}/.venv/bin/python ${H3_UI_DIR}/app.py
 Restart=on-failure
 RestartSec=10
@@ -313,7 +385,8 @@ main() {
   log ""
   log "=== MiniMax-H3 UI ready ==="
   log "  UI      : http://<EIP>:${H3_UI_PORT}"
-  log "  Backend : ${H3_API_BASE}"
+  log "  Backend : ${H3_API_BASE} (ref2va)"
+  log "  Uploads : ${H3_MEDIA_DIR} -> ${H3_MEDIA_MOUNT} in the SGLang container"
   log "  Logs    : sudo journalctl -fu ${H3_UI_NAME}"
 }
 

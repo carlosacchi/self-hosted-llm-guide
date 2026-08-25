@@ -223,8 +223,6 @@ resource "aws_launch_template" "llm_gpu" {
     enable_asr                = var.enable_asr
     asr_model                 = var.asr_model
     enable_h3                 = var.enable_h3
-    h3_variant                = var.h3_variant
-    h3_model_variant          = var.h3_model_variant
     h3_sglang_image           = var.h3_sglang_image
 
     # Cost guardrails, applied to every workload (not just H3).
@@ -358,7 +356,7 @@ resource "aws_autoscaling_group" "llm_gpu" {
         for t in local.requested_instance_types : t
         if !contains(local.h3_capable_instance_types, t)
       ]) == 0
-      error_message = "enable_h3 restricts every instance type in the waterfall to ${join(" or ", local.h3_capable_instance_types)}. Got: ${join(", ", local.requested_instance_types)}. H3 cannot run on a single 24 GB GPU, and the other multi-GPU sizes in this repo (g5.12xlarge/g5.24xlarge) are A10G 24 GB, far too small even with layerwise offload."
+      error_message = "enable_h3 restricts every instance type in the waterfall to ${join(" or ", local.h3_capable_instance_types)}. Got: ${join(", ", local.requested_instance_types)}. This stack serves the Ref2VA partition, which denoises to snow/noise on compute-capability 8.9 cards (the 4x L40S g6e.12xlarge shape) -- see https://github.com/sgl-project/sglang/issues/34110 -- and H3 cannot run at all on the 24 GB A10G sizes (g5.12xlarge/g5.24xlarge)."
     }
 
     precondition {
@@ -367,18 +365,13 @@ resource "aws_autoscaling_group" "llm_gpu" {
     }
 
     precondition {
-      condition     = !var.enable_h3 || var.root_volume_size >= (var.h3_variant == "both" ? 500 : 300)
-      error_message = "enable_h3 with h3_variant = \"${var.h3_variant}\" requires root_volume_size >= ${var.h3_variant == "both" ? 500 : 300} GiB. Each checkpoint partition is ~144 GB on disk (the HF repo also ships a parallel diffusers layout, ~498 GB in total, which this stack deliberately does NOT download), plus the pinned SGLang image, CUDA/torch layers and generated MP4s."
-    }
-
-    precondition {
-      condition     = !var.enable_h3 || var.h3_model_variant == "" || var.h3_variant == "both" || var.h3_model_variant == var.h3_variant
-      error_message = "h3_model_variant = \"${var.h3_model_variant}\" cannot be served: h3_variant = \"${var.h3_variant}\" only downloads that one partition. Set h3_variant to \"${var.h3_model_variant}\", or to \"both\" to keep either partition available for a runtime switch."
+      condition     = !var.enable_h3 || var.root_volume_size >= 300
+      error_message = "enable_h3 requires root_volume_size >= 300 GiB. The Ref2VA checkpoint partition is ~144 GB on disk (the HF repo also ships the FL2VA partition and a parallel diffusers layout, ~498 GB in total, which this stack deliberately does NOT download), plus the pinned SGLang image, CUDA/torch layers and generated MP4s."
     }
 
     precondition {
       condition     = !var.enable_h3 || contains(["eu-central-1", "eu-north-1", "eu-south-2"], var.aws_region)
-      error_message = "enable_h3 requires aws_region to be eu-central-1, eu-north-1 or eu-south-2. Those are the three EU regions offering G6e/G7e .12xlarge; g6e.12xlarge is not offered in eu-west-1 at all, and while it exists in us-east-2 the account's 'Running On-Demand G and VT instances' quota there is 0."
+      error_message = "enable_h3 requires aws_region to be eu-central-1, eu-north-1 or eu-south-2. Those are the three EU regions offering G7e .12xlarge; while it exists in us-east-2 the account's 'Running On-Demand G and VT instances' quota there is 0."
     }
 
     precondition {

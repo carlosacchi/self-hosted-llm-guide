@@ -16,12 +16,12 @@ variable "instance_type" {
 
   validation {
     condition     = contains(["g5.xlarge", "g5.2xlarge", "g5.4xlarge", "g5.8xlarge", "g5.12xlarge", "g5.24xlarge", "g6e.12xlarge", "g7e.12xlarge"], var.instance_type)
-    error_message = "Supported instance types: g5.xlarge, g5.2xlarge, g5.4xlarge, g5.8xlarge (single A10G) | g5.12xlarge, g5.24xlarge (multi A10G) | g6e.12xlarge (4x L40S 48 GB), g7e.12xlarge (2x RTX PRO 6000 96 GB) -- the two H3-capable shapes."
+    error_message = "Supported instance types: g5.xlarge, g5.2xlarge, g5.4xlarge, g5.8xlarge (single A10G) | g5.12xlarge, g5.24xlarge (multi A10G) | g6e.12xlarge (4x L40S 48 GB) | g7e.12xlarge (2x RTX PRO 6000 96 GB) -- the only shape enable_h3 accepts."
   }
 }
 
 variable "instance_type_fallbacks" {
-  description = "Ordered fallback instance types for the Auto Scaling group to try when the preferred one has no capacity. Leave empty to use the built-in default: the other H3-capable type when enable_h3 is set, nothing otherwise. Types the active region does not offer are dropped automatically."
+  description = "Ordered fallback instance types for the Auto Scaling group to try when the preferred one has no capacity. Leave empty for no fallback. Types the active region does not offer are dropped automatically. enable_h3 restricts every entry to g7e.12xlarge."
   type        = list(string)
   default     = []
 }
@@ -120,31 +120,9 @@ variable "asr_model" {
 # exclusive with every other GPU stack (enforced by preconditions in compute.tf).
 
 variable "enable_h3" {
-  description = "Provision the MiniMax-H3 stack: SGLang-Diffusion video+audio generation (REST 30010, Gradio UI 7865). Requires an H3-capable instance type (g6e.12xlarge / g7e.12xlarge) and excludes every other GPU stack."
+  description = "Provision the MiniMax-H3 stack: SGLang-Diffusion image-reference video+audio generation (REST 30010, Gradio UI 7865). Serves the Ref2VA checkpoint partition, requires g7e.12xlarge, and excludes every other GPU stack."
   type        = bool
   default     = false
-}
-
-variable "h3_variant" {
-  description = "MiniMax-H3 checkpoint partition(s) to download: 'fl2va' (t2va + first/last-frame conditioning), 'ref2va' (image/video/audio reference conditioning), or 'both' (~288 GB on disk, switchable at runtime)."
-  type        = string
-  default     = "fl2va"
-
-  validation {
-    condition     = contains(["fl2va", "ref2va", "both"], var.h3_variant)
-    error_message = "h3_variant must be 'fl2va', 'ref2va' or 'both'. Note that ref2va produces snow/noise output on compute-capability 8.9 GPUs (the 4x L40S g6e.12xlarge shape) while fl2va is healthy on the same hardware -- see https://github.com/sgl-project/sglang/issues/34110. It is unaffected on the RTX PRO 6000 Blackwell (g7e.12xlarge)."
-  }
-}
-
-variable "h3_model_variant" {
-  description = "Which downloaded partition the SGLang service mounts. Empty follows h3_variant (and picks fl2va when both are downloaded). Switchable later on the VM via H3_MODEL_VARIANT in /etc/llm-lab-h3.env."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = contains(["", "fl2va", "ref2va"], var.h3_model_variant)
-    error_message = "h3_model_variant must be empty, 'fl2va' or 'ref2va'. 'both' is a download option, not something a single server can mount."
-  }
 }
 
 variable "h3_sglang_image" {
@@ -154,13 +132,13 @@ variable "h3_sglang_image" {
 }
 
 variable "root_volume_size" {
-  description = "Root EBS volume size in GiB. The H3 stack needs >= 300: the FL2VA partition alone is ~144 GB on disk (66 GB transformer + 66 GB text encoder + 10 GB video VAE), plus the pinned SGLang image and generated videos."
+  description = "Root EBS volume size in GiB. The H3 stack needs >= 300: the Ref2VA partition alone is ~144 GB on disk (66 GB transformer + 66 GB text encoder + 10 GB video VAE), plus the pinned SGLang image and generated videos."
   type        = number
   default     = 200
 }
 
 variable "root_volume_throughput" {
-  description = "Root gp3 throughput in MiB/s (125-1000). This is the real bottleneck for H3: writing the 144 GB FL2VA checkpoint at the 125 MiB/s default takes ~19 minutes of paid-for instance time, and every later boot re-reads it. At 1000 MiB/s that drops to ~2.5 minutes."
+  description = "Root gp3 throughput in MiB/s (125-1000). This is the real bottleneck for H3: writing the 144 GB Ref2VA checkpoint at the 125 MiB/s default takes ~19 minutes of paid-for instance time, and every later boot re-reads it. At 1000 MiB/s that drops to ~2.5 minutes."
   type        = number
   default     = 125
 
