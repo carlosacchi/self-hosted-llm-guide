@@ -422,22 +422,16 @@ install_systemd_service() {
   # paying for when there are more GPUs than the tensor-parallel degree, so it
   # stays at 1 here.
   #
-  # The DiT is NOT offloaded by default. H3's DiT is ~62 GB of weights; TP2
-  # halves that to ~31 GB per GPU, which a 96 GB card holds outright. Streaming
-  # it also blocks Cache-DiT and CUDA-graph execution, which are worth far more
-  # than the PCIe traffic it saves. The text encoder and VAE stay layerwise
-  # because they run once per request, not once per denoise step.
+  # The DiT is resident. H3's DiT is ~62 GB of weights; TP2 halves that to ~31 GB
+  # per GPU, which a 96 GB card holds outright. Streaming it also blocks Cache-DiT
+  # and CUDA-graph execution, which are worth far more than the PCIe traffic it
+  # saves. The text encoder and VAE stay layerwise because they run once per
+  # request, not once per denoise step, so streaming them is nearly free.
   #
-  # If the server OOMs, walk DOWN this ladder in order:
-  #
-  #   1. H3_OFFLOAD_COMPONENTS=dit,text_encoder,vae  stream the DiT again; this
-  #      re-arms H3_RESIDENT_LAYERS / H3_OFFLOAD_PREFETCH below
-  #   2. H3_RESIDENT_LAYERS=0        keep no DiT layers resident (slower, leanest)
-  #   3. H3_OFFLOAD_PREFETCH=0       stop prefetching the next layer
-  #   4. H3_DIT_CPU_OFFLOAD=true     full CPU offload of the transformer
-  #
-  # Whatever ends up working, write it into the Terraform defaults so the next
-  # deploy does not re-discover it at $13/hour.
+  # H3_DIT_CPU_OFFLOAD=true is the one escape hatch if the DiT stops fitting - a
+  # different card, or a longer clip whose activations eat the headroom. Write
+  # whatever ends up working into the Terraform defaults so the next deploy does
+  # not re-discover it at $13/hour.
 
   cat > /etc/llm-lab-h3.env <<EOF
 # Serving the Ref2VA checkpoint partition: task "ref2va" with image, video and
@@ -447,10 +441,6 @@ H3_NUM_GPUS=${H3_NUM_GPUS:-${DETECTED_GPUS}}
 H3_TP_SIZE=${H3_TP_SIZE:-2}
 H3_ULYSSES=${H3_ULYSSES:-1}
 H3_PERFORMANCE_MODE=${H3_PERFORMANCE_MODE:-memory}
-H3_OFFLOAD_COMPONENTS=${H3_OFFLOAD_COMPONENTS:-text_encoder,vae}
-# Only used when H3_OFFLOAD_COMPONENTS contains 'dit'.
-H3_RESIDENT_LAYERS=${H3_RESIDENT_LAYERS:-20}
-H3_OFFLOAD_PREFETCH=${H3_OFFLOAD_PREFETCH:-1}
 H3_DIT_CPU_OFFLOAD=${H3_DIT_CPU_OFFLOAD:-false}
 EOF
 
@@ -469,14 +459,9 @@ if ! compgen -G "${H3_MODEL_DIR}/${H3_PARTITION_DIR}/transformer/*.safetensors" 
   exit 1
 fi
 
-extra_args=()
+dit_residency=(--dit-layerwise-offload false)
 if [[ "\${H3_DIT_CPU_OFFLOAD}" == "true" ]]; then
-  extra_args+=(--dit-cpu-offload true --dit-layerwise-offload true)
-elif [[ ",\${H3_OFFLOAD_COMPONENTS}," == *",dit,"* ]]; then
-  extra_args+=(--dit-offload-prefetch-size "\${H3_OFFLOAD_PREFETCH}")
-  extra_args+=(--dit-layerwise-resident-layers "\${H3_RESIDENT_LAYERS}")
-else
-  extra_args+=(--dit-layerwise-offload false)
+  dit_residency=(--dit-cpu-offload true --dit-layerwise-offload true)
 fi
 
 exec docker run --rm --name ${H3_NAME} \\
@@ -497,11 +482,11 @@ exec docker run --rm --name ${H3_NAME} \\
     --tp-size "\${H3_TP_SIZE}" \\
     --ulysses-degree "\${H3_ULYSSES}" \\
     --performance-mode "\${H3_PERFORMANCE_MODE}" \\
-    --layerwise-offload-components "\${H3_OFFLOAD_COMPONENTS}" \\
+    --layerwise-offload-components text_encoder,vae \\
+    "\${dit_residency[@]}" \\
     --enable-torch-compile false \\
     --host 0.0.0.0 \\
-    --port ${H3_PORT} \\
-    "\${extra_args[@]}"
+    --port ${H3_PORT}
 EOF
   chmod +x /opt/llm-lab/bin/run-sglang-h3.sh
 
