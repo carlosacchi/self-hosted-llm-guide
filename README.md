@@ -518,11 +518,12 @@ The swap exists for a specific reason: layerwise offload streams the model throu
 
 ### Tuning when it OOMs
 
-There is no published RTX PRO 6000 profile — the SGLang cookbook covers H200, H100, B200, RTX 5090 and RTX 4090. The defaults here start from the verified 2× RTX 5090 layerwise-offload recipe, the closest memory-constrained shape. If the server OOMs while loading weights, edit `/etc/llm-lab-h3.env` and walk down this ladder:
+There is no published RTX PRO 6000 profile — the SGLang cookbook covers H200, H100, B200, RTX 5090 and RTX 4090. The DiT is kept resident here: it is ~62 GB of weights, TP2 halves that to ~31 GB per GPU, and a 96 GB card holds it outright. Only the text encoder and the VAE are streamed, because they run once per request rather than once per denoise step. If the server OOMs while loading weights, edit `/etc/llm-lab-h3.env` and walk down this ladder:
 
-1. `H3_RESIDENT_LAYERS=0` — keep no DiT layers resident (slower, leanest)
-2. `H3_OFFLOAD_PREFETCH=0` — stop prefetching the next layer
-3. `H3_DIT_CPU_OFFLOAD=true` — full CPU offload of the transformer
+1. `H3_OFFLOAD_COMPONENTS=dit,text_encoder,vae` — stream the DiT again; this re-arms the two knobs below
+2. `H3_RESIDENT_LAYERS=0` — keep no DiT layers resident (slower, leanest)
+3. `H3_OFFLOAD_PREFETCH=0` — stop prefetching the next layer
+4. `H3_DIT_CPU_OFFLOAD=true` — full CPU offload of the transformer
 
 Then `sudo systemctl restart sglang-h3`. Whatever ends up working, commit it to the Terraform defaults so the next deploy does not rediscover it at $13/hour.
 
