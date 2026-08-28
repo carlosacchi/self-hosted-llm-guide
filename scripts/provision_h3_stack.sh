@@ -205,17 +205,18 @@ install_nvme_scratch_unit() {
   log "Installing NVMe scratch/swap setup unit..."
 
   install -d -m 0755 /opt/llm-lab/bin
+  install -m 0644 "$(dirname "${BASH_SOURCE[0]}")/lib_cloud.sh" /opt/llm-lab/bin/lib_cloud.sh
 
   cat > /opt/llm-lab/bin/setup-nvme-scratch.sh <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Prepare the instance-store NVMe as scratch space and swap.
+# Prepare the ephemeral local NVMe as scratch space and swap.
 #
-# Runs on EVERY boot: AWS instance storage is wiped whenever the instance is
-# stopped, so the filesystem, the swapfile and the mount all have to be
-# recreated. Everything here is expendable by design; nothing that must survive
-# a stop is allowed to live on this device.
+# Runs on EVERY boot: local NVMe is wiped whenever the instance is stopped (AWS)
+# or deallocated (Azure), so the filesystem, the swapfile and the mount all have
+# to be recreated. Everything here is expendable by design; nothing that must
+# survive a stop is allowed to live on this device.
 
 NVME_MOUNT="${NVME_MOUNT}"
 NVME_SCRATCH="${NVME_SCRATCH}"
@@ -223,22 +224,22 @@ SWAP_GIB="${SWAP_GIB}"
 
 log() { echo "[setup-nvme-scratch] \$*"; }
 
-# Identify instance-store devices by model string. The root EBS volume reports
-# "Amazon Elastic Block Store" and must never be touched here.
-mapfile -t devices < <(
-  lsblk -dno NAME,MODEL 2>/dev/null \
-    | grep -i 'Instance Storage' \
-    | awk '{print "/dev/"\$1}'
-)
+# shellcheck disable=SC1091
+source /opt/llm-lab/bin/lib_cloud.sh
+
+# find_ephemeral_nvme() matches on the device model string, which is the only
+# reliable discriminator: the AWS root EBS volume and the Azure OS disk are both
+# block devices of a similar size and must never be formatted here.
+mapfile -t devices < <(find_ephemeral_nvme)
 
 if [[ \${#devices[@]} -eq 0 ]]; then
-  log "No instance-store NVMe found; skipping scratch/swap setup."
+  log "No ephemeral NVMe found; skipping scratch/swap setup."
   log "H3 will run without the swap cushion - watch host RAM closely."
   exit 0
 fi
 
 device="\${devices[0]}"
-log "Using \${device} for scratch and swap (\${#devices[@]} instance-store device(s) present)."
+log "Using \${device} for scratch and swap (\${#devices[@]} local device(s) present)."
 
 mkdir -p "\${NVME_MOUNT}"
 

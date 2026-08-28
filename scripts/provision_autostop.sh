@@ -12,22 +12,29 @@ set -euo pipefail
 #   1. Hard TTL      systemd timer, N hours after boot, unconditionally.
 #   2. Idle stop     systemd timer, every 5 min: stop after N minutes with an
 #                    idle GPU and no user traffic on the service ports.
-#   3. Nightly       EventBridge Scheduler, 01:00 Europe/Amsterdam
-#                    (infra/operations.tf). Sets the Auto Scaling group's
-#                    desired capacity to 0, which TERMINATES the instance.
+#   3. Nightly       AWS:   EventBridge Scheduler, ASG desired=0 (TERMINATES).
+#                    Azure: auto-shutdown schedule (DEALLOCATES, disk kept).
+#                    Both at 01:00 Europe/Amsterdam.
 #
-# Layers 1 and 2 live inside the VM and call `systemctl poweroff`. On an
-# EBS-backed instance an OS shutdown STOPS the instance rather than terminating
-# it (Terraform pins instance_initiated_shutdown_behavior = "stop" in the launch
-# template), so the root volume and the model cache survive untouched and no
-# extra IAM permissions are needed.
+# Layers 1 and 2 live inside the VM and call stop_self() from lib_cloud.sh,
+# which is NOT the same operation on both clouds:
 #
-# That still holds now that the instance is owned by an Auto Scaling group, but
-# only because of one deliberate choice: the group runs with HealthCheck,
-# ReplaceUnhealthy and AZRebalance suspended. A default ASG would fail the
-# stopped instance's health check, terminate it, and launch a replacement --
-# turning this guardrail into a billing loop at ~$13/hour. If you ever un-suspend
-# those processes, these two layers must be rewritten to call
+#   AWS    `systemctl poweroff`. The launch template pins
+#          instance_initiated_shutdown_behavior = "stop", so an OS shutdown
+#          stops the instance instead of terminating it: the root volume and
+#          the model cache survive and no extra IAM permissions are needed.
+#
+#   Azure  an ARM deallocate call, authenticated with the VM's own managed
+#          identity. A guest poweroff on Azure leaves the VM ALLOCATED and
+#          fully billed -- the guardrail would run, report success, and save
+#          nothing.
+#
+# The AWS path still holds now that the instance is owned by an Auto Scaling
+# group, but only because of one deliberate choice: the group runs with
+# HealthCheck, ReplaceUnhealthy and AZRebalance suspended. A default ASG would
+# fail the stopped instance's health check, terminate it, and launch a
+# replacement -- turning this guardrail into a billing loop at ~$13/hour. If you
+# ever un-suspend those processes, these two layers must be rewritten to call
 # `aws autoscaling set-desired-capacity --desired-capacity 0` instead.
 #
 # Why this matters: a g6e.12xlarge bills at roughly $13/hour in eu-central-1.
@@ -80,6 +87,17 @@ write_config() {
   log "Writing ${CONF_DIR}/autostop.env ..."
   install -d -m 0755 "${CONF_DIR}" "${BIN_DIR}"
 
+  # The Azure deallocate path parses IMDS JSON; the AWS path does not need it,
+  # but the probe cannot know which cloud it is on before jq exists.
+  if ! command -v jq >/dev/null 2>&1; then
+    log "Installing jq (required by the Azure deallocate path)..."
+    apt-get update -y && apt-get install -y jq
+  fi
+
+  # Give the timers a copy at a stable path: the provisioning directory is not
+  # guaranteed to survive, and these units run for the life of the VM.
+  install -m 0644 "$(dirname "${BASH_SOURCE[0]}")/lib_cloud.sh" "${BIN_DIR}/lib_cloud.sh"
+
   cat > "${CONF_DIR}/autostop.env" <<EOF
 # Autostop tuning. Edit, then:
 #   sudo systemctl restart llm-lab-ttl.timer llm-lab-idle.timer
@@ -112,10 +130,12 @@ write_idle_check() {
 set -uo pipefail
 
 # Decide whether the VM has been idle long enough to stop itself.
-# Exit status is irrelevant; the side effect (poweroff) is the point.
+# Exit status is irrelevant; the side effect (stop_self) is the point.
 
 # shellcheck disable=SC1091
 source /etc/llm-lab/autostop.env
+# shellcheck disable=SC1091
+source /opt/llm-lab/bin/lib_cloud.sh
 
 STATE_FILE=/run/llm-lab-idle-count
 LOG_TAG="llm-lab-idle"
@@ -202,10 +222,9 @@ idle_min=$(( count * interval ))
 say "idle ${idle_min}/${IDLE_STOP_MINUTES} min (check ${count}/${needed})"
 
 if (( count >= needed )); then
-  say "STOPPING: idle for ${idle_min} minutes. An OS poweroff stops (does not terminate) this instance; the root volume and model cache are kept."
+  say "STOPPING: idle for ${idle_min} minutes. The root volume and model cache are kept."
   rm -f "${STATE_FILE}"
-  sync
-  systemctl poweroff
+  stop_self "idle for ${idle_min} minutes"
 fi
 EOF
   chmod +x "${BIN_DIR}/idle-check.sh"
@@ -224,6 +243,8 @@ set -uo pipefail
 
 # shellcheck disable=SC1091
 source /etc/llm-lab/autostop.env
+# shellcheck disable=SC1091
+source /opt/llm-lab/bin/lib_cloud.sh
 
 if [[ "${AUTO_STOP_HOURS:-0}" -le 0 ]]; then
   exit 0
@@ -231,8 +252,7 @@ fi
 
 logger -t llm-lab-ttl -- "STOPPING: hard TTL of ${AUTO_STOP_HOURS}h since boot reached."
 echo "[llm-lab-ttl] Hard TTL reached (${AUTO_STOP_HOURS}h since boot). Stopping the instance."
-sync
-systemctl poweroff
+stop_self "hard TTL of ${AUTO_STOP_HOURS}h since boot"
 EOF
   chmod +x "${BIN_DIR}/ttl-stop.sh"
 }
@@ -325,22 +345,25 @@ main() {
 
   log ""
   log "=== Autostop guardrails installed ==="
+  log "  Cloud      : $(sed -n 1p /etc/llm-lab/cloud 2>/dev/null || echo 'detected on first probe')"
   log "  Hard TTL   : ${AUTO_STOP_HOURS}h after boot (0 = off)"
   log "  Idle stop  : ${IDLE_STOP_MINUTES} min idle (0 = off)"
-  log "  Nightly    : 01:00 Europe/Amsterdam, ASG desired=0 (see infra/operations.tf)"
+  log "  Nightly    : 01:00 Europe/Amsterdam (see infra/<cloud>/operations.tf)"
   log ""
   log "  Inspect    : systemctl list-timers 'llm-lab-*'"
   log "  Idle log   : journalctl -t llm-lab-idle"
   log "  Tune       : sudo nano ${CONF_DIR}/autostop.env"
   log "  Pin awake  : sudo touch /run/llm-lab-busy   (removes on reboot)"
   log ""
-  log "  A poweroff STOPS this instance, it does not terminate it: the root"
-  log "  volume and any cached models survive. The Auto Scaling group will not"
-  log "  replace it, because HealthCheck/ReplaceUnhealthy are suspended."
-  log "  Restart it from the AWS console or with:"
-  log "    aws ec2 start-instances --instance-ids <id>"
+  log "  Stopping keeps the root volume and any cached models on both clouds."
+  log "  On AWS a poweroff becomes an EC2 stop and the Auto Scaling group will"
+  log "  not replace it (HealthCheck/ReplaceUnhealthy are suspended); restart"
+  log "  with: aws ec2 start-instances --instance-ids <id>"
+  log "  On Azure the VM is DEALLOCATED through ARM -- a plain guest poweroff"
+  log "  would keep the allocation billed; restart with:"
+  log "    az vm start -g <resource-group> -n <vm-name>"
   log ""
-  log "  The NIGHTLY layer is different: it terminates. Anything not on a"
+  log "  The AWS NIGHTLY layer is different: it terminates. Anything not on a"
   log "  snapshot has to be downloaded again the next morning."
 }
 

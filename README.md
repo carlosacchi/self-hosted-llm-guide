@@ -116,7 +116,7 @@ A g5.xlarge costs ~$1.20/h, so forgetting it running overnight is a $20 mistake.
 |---|---|---|---|---|
 | **Hard TTL** | systemd timer, `OnBootSec` | **stop** | stop **4 h** after boot | `auto_stop_hours` workflow input (`0` disables) |
 | **Idle stop** | systemd timer, probed every 5 min | **stop** | stop after **30 min** with GPU < 5 % and no connections on the service ports | `idle_stop_minutes` Terraform var |
-| **Nightly** | EventBridge Scheduler → ASG `desired=0` | **terminate** | **01:00 Europe/Amsterdam** | `infra/operations.tf` |
+| **Nightly** | EventBridge Scheduler → ASG `desired=0` | **terminate** | **01:00 Europe/Amsterdam** | `infra/aws/operations.tf` |
 
 The first two layers call `systemctl poweroff`. The launch template pins `instance_initiated_shutdown_behavior = "stop"`, so an OS shutdown **stops** the instance rather than terminating it — the root volume and any cached models survive untouched, and no extra IAM permissions are needed.
 

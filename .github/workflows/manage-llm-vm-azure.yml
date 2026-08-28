@@ -1,0 +1,221 @@
+name: Manage GPU VM (Azure)
+
+on:
+    workflow_dispatch:
+        inputs:
+            action:
+                description: "Choose whether to create (apply) or destroy the infrastructure"
+                type: choice
+                options:
+                    - apply
+                    - destroy
+                default: apply
+            vm_size:
+                description: "VM size. NC80adis_H100_v5 = 2x H100 NVL 94 GB (default: the SGLang cookbook publishes a verified H100 TP2 recipe). NC288*_RTXPRO6000BSE_v6 = 2x RTX PRO 6000 96 GB, same silicon as the AWS g7e box but sold with 288 vCPUs."
+                type: choice
+                options:
+                    - Standard_NC80adis_H100_v5
+                    - Standard_NC288lds_xl_RTXPRO6000BSE_v6
+                    - Standard_NC288ds_xl_RTXPRO6000BSE_v6
+                default: Standard_NC80adis_H100_v5
+            location:
+                description: "Azure region. GPU SKUs are region-scoped AND quota-gated per family; the preflight step below checks both before anything is billed."
+                type: choice
+                options:
+                    - westeurope
+                    - northeurope
+                    - swedencentral
+                    - germanywestcentral
+                    - eastus2
+                default: westeurope
+            ipv4_allowed:
+                description: "Single IPv4 address allowed to reach SSH/Web/API"
+                required: true
+            ssh_public_key:
+                description: "OpenSSH public key for the admin user. Leave empty to deploy with no SSH login at all (provisioning still runs via cloud-init; use `az vm run-command` to read logs)."
+                required: false
+                default: ""
+            os_disk_size:
+                description: "OS disk GiB. On Premium_LRS the throughput comes from the capacity tier, so this is bought for speed: 512 = P20 (150 MB/s), 1024 = P30 (200 MB/s). The Ref2VA checkpoint is ~144 GB and is re-read on every boot."
+                type: choice
+                options:
+                    - "1024"
+                    - "512"
+                default: "1024"
+            auto_stop_hours:
+                description: "Hard time-to-live: deallocate the VM this many hours after boot, whatever happens. '0' disables it. Idle-stop (30 min) and the 01:00 nightly deallocate apply on top."
+                type: choice
+                options:
+                    - "2"
+                    - "4"
+                    - "8"
+                    - "0"
+                default: "4"
+
+# Unlike the AWS workflow this really does use OIDC: no client secret exists.
+# Required setup, once per subscription:
+#
+#   1. App registration + service principal.
+#   2. Federated credential on it:
+#        issuer   https://token.actions.githubusercontent.com
+#        subject  repo:<owner>/<repo>:ref:refs/heads/main
+#        audience api://AzureADTokenExchange
+#   3. Role assignments for that principal on the subscription:
+#        - Contributor              (create the lab)
+#        - User Access Administrator (grant the VM its two roles -- see
+#          infra/azure/provisioning.tf. Contributor alone CANNOT assign roles,
+#          and without them the VM can neither fetch its scripts nor deallocate
+#          itself, which quietly turns the cost guardrails into decoration.)
+#   4. Repo secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID,
+#      TF_STATE_RESOURCE_GROUP, TF_STATE_STORAGE_ACCOUNT, TF_STATE_CONTAINER.
+#
+# The state storage account must pre-exist, exactly like the S3 bucket on the
+# AWS side: Terraform cannot create the thing it stores its own state in.
+
+jobs:
+    terraform:
+        name: Run Terraform (Azure)
+        runs-on: ubuntu-latest
+        permissions:
+            id-token: write
+            contents: read
+
+        env:
+            ARM_USE_OIDC: "true"
+            ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+            ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+            ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+            TF_VAR_location: ${{ inputs.location }}
+            TF_VAR_vm_size: ${{ inputs.vm_size }}
+            TF_VAR_ipv4_allowed: ${{ inputs.ipv4_allowed }}
+            TF_VAR_ssh_public_key: ${{ inputs.ssh_public_key }}
+            TF_VAR_os_disk_size: ${{ inputs.os_disk_size }}
+            TF_VAR_auto_stop_hours: ${{ inputs.auto_stop_hours }}
+
+            # State key is scoped per region, same reasoning as the AWS workflow:
+            # every resource here is region-bound, so each region keeps its own file.
+            TF_STATE_KEY: llm-gpu/azure/${{ inputs.location }}/terraform.tfstate
+
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v5
+
+            - name: Azure login (OIDC)
+              uses: azure/login@v2
+              with:
+                  client-id: ${{ secrets.AZURE_CLIENT_ID }}
+                  tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+                  subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+            # The AWS stack catches impossible deployments with Terraform
+            # preconditions. Azure needs a live API call instead: SKU availability and
+            # quota are account state, not configuration, and a GPU family quota of 0
+            # is the default rather than the exception.
+            - name: Preflight - SKU availability and quota
+              if: ${{ inputs.action == 'apply' }}
+              run: |
+                  set -euo pipefail
+                  LOC="${{ inputs.location }}"
+                  SIZE="${{ inputs.vm_size }}"
+
+                  echo "### H3-capable sizes in $LOC" >> "$GITHUB_STEP_SUMMARY"
+                  echo "" >> "$GITHUB_STEP_SUMMARY"
+                  echo "| Size | Offered | Restrictions |" >> "$GITHUB_STEP_SUMMARY"
+                  echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+                  for candidate in \
+                    Standard_NC80adis_H100_v5 \
+                    Standard_NC288lds_xl_RTXPRO6000BSE_v6 \
+                    Standard_NC288ds_xl_RTXPRO6000BSE_v6; do
+                    row="$(az vm list-skus -l "$LOC" --size "$candidate" --resource-type virtualMachines --all -o json \
+                      | jq -r --arg n "$candidate" '
+                          (map(select(.name == $n)) | first) as $s
+                          | if $s == null then "| \($n) | no | not offered in this region |"
+                            elif ($s.restrictions | length) > 0
+                              then "| \($n) | listed | \($s.restrictions | map(.reasonCode) | join(", ")) |"
+                            else "| \($n) | yes | none |"
+                            end')"
+                    echo "$row" >> "$GITHUB_STEP_SUMMARY"
+                  done
+
+                  FAMILY="$(az vm list-skus -l "$LOC" --size "$SIZE" --resource-type virtualMachines --all -o json \
+                    | jq -r --arg n "$SIZE" 'map(select(.name == $n)) | first | .family // empty')"
+
+                  if [[ -z "$FAMILY" ]]; then
+                    echo "::error::$SIZE is not offered in $LOC. See the table in the job summary and pick another region or size."
+                    exit 1
+                  fi
+
+                  # vCPU quota for the family. Default is 0 on a fresh subscription, and
+                  # `terraform apply` would otherwise succeed at creating the network and
+                  # then fail on the VM after the storage account is already up.
+                  read -r LIMIT CURRENT < <(az vm list-usage -l "$LOC" -o json \
+                    | jq -r --arg f "$FAMILY" '.[] | select(.name.value == $f) | "\(.limit) \(.currentValue)"')
+
+                  echo "" >> "$GITHUB_STEP_SUMMARY"
+                  echo "Family \`$FAMILY\` quota in \`$LOC\`: ${CURRENT:-?} / ${LIMIT:-?} vCPUs used." >> "$GITHUB_STEP_SUMMARY"
+
+                  if [[ "${LIMIT:-0}" -eq 0 ]]; then
+                    echo "::error::Quota for $FAMILY in $LOC is 0 vCPUs. Request an increase before deploying: az quota / Azure portal -> Subscriptions -> Usage + quotas."
+                    exit 1
+                  fi
+
+            - name: Set up Terraform
+              uses: hashicorp/setup-terraform@v4
+              with:
+                  terraform_version: 1.14.1
+
+            - name: Terraform Init
+              working-directory: infra/azure
+              env:
+                  ARM_OIDC_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+                  ARM_OIDC_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+              run: |
+                  terraform init \
+                    -backend-config="resource_group_name=${{ secrets.TF_STATE_RESOURCE_GROUP }}" \
+                    -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+                    -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+                    -backend-config="key=${{ env.TF_STATE_KEY }}"
+
+            - name: Terraform Plan
+              if: ${{ inputs.action == 'apply' }}
+              working-directory: infra/azure
+              env:
+                  ARM_OIDC_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+                  ARM_OIDC_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+              run: terraform plan -input=false
+
+            - name: Terraform Apply
+              if: ${{ inputs.action == 'apply' }}
+              working-directory: infra/azure
+              env:
+                  ARM_OIDC_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+                  ARM_OIDC_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+              run: terraform apply -input=false -auto-approve
+
+            # Unlike the AWS side there is no capacity hunt to report: the VM either
+            # allocated or the apply failed. What is worth reporting is where to look
+            # while first boot spends 30-45 minutes downloading the checkpoint.
+            - name: Report endpoints
+              if: ${{ inputs.action == 'apply' }}
+              working-directory: infra/azure
+              run: |
+                  {
+                    echo "### Deployed"
+                    echo ""
+                    echo '```'
+                    terraform output
+                    echo '```'
+                    echo ""
+                    echo "First boot installs the NVIDIA driver, then downloads the ~144 GB Ref2VA checkpoint."
+                    echo "The REST API does not answer until that finishes."
+                  } >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Terraform Destroy
+              if: ${{ inputs.action == 'destroy' }}
+              working-directory: infra/azure
+              env:
+                  ARM_OIDC_REQUEST_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+                  ARM_OIDC_REQUEST_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+              run: terraform destroy -input=false -auto-approve

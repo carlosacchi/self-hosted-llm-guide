@@ -159,7 +159,7 @@ jobs:
           terraform_version: 1.14.1
 
       - name: Terraform Init
-        working-directory: infra
+        working-directory: infra/aws
         run: |
           terraform init \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
@@ -168,12 +168,12 @@ jobs:
 
       - name: Terraform Plan
         if: ${{ inputs.action == 'apply' }}
-        working-directory: infra
+        working-directory: infra/aws
         run: terraform plan -input=false
 
       - name: Terraform Apply
         if: ${{ inputs.action == 'apply' }}
-        working-directory: infra
+        working-directory: infra/aws
         run: terraform apply -input=false -auto-approve
 
       # `apply` does not wait for capacity: the ASG keeps hunting across every
@@ -181,7 +181,7 @@ jobs:
       # that reports whether it actually found a GPU, and why not.
       - name: Report capacity hunt
         if: ${{ inputs.action == 'apply' }}
-        working-directory: infra
+        working-directory: infra/aws
         run: |
           ASG="$(terraform output -raw asg_name)"
           echo "Auto Scaling group: $ASG"
@@ -197,5 +197,5 @@ jobs:
 
       - name: Terraform Destroy
         if: ${{ inputs.action == 'destroy' }}
-        working-directory: infra
+        working-directory: infra/aws
         run: terraform destroy -input=false -auto-approve

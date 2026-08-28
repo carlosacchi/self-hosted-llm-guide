@@ -205,7 +205,7 @@ resource "aws_launch_template" "llm_gpu" {
   # The instance downloads the provisioning scripts from a private S3 bucket
   # using its IAM role, then runs them as root. This keeps user-data under the
   # 16 KB EC2 limit. Logs land in /var/log/llm-lab-bootstrap.log on the VM.
-  user_data = var.run_bootstrap ? base64encode(templatefile("${path.module}/../scripts/user-data.sh", {
+  user_data = var.run_bootstrap ? base64encode(templatefile("${path.module}/../../scripts/user-data.sh", {
     scripts_bucket = aws_s3_bucket.scripts[0].bucket
     aws_region     = var.aws_region
 
