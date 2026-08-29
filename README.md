@@ -1,8 +1,10 @@
-# Self-Hosted AI Lab on AWS
+# Self-Hosted AI Lab on AWS and Azure
 
-Terraform + GitHub Actions to provision a **single or multi-GPU EC2 VM** across **5 supported AWS regions**. The VM is launched by an **Auto Scaling group that hunts for GPU capacity** across every compatible instance type and availability zone, and the application stack deploys **automatically via cloud-init on first boot** — no SSH key, no manual steps — with a **service portal on port 80** giving you one clickable index of everything running.
+Terraform + GitHub Actions to provision a **single or multi-GPU VM**. On **AWS** the VM is launched by an **Auto Scaling group that hunts for GPU capacity** across every compatible instance type and availability zone, in 5 supported regions. On **Azure** it is a plain VM guarded by a preflight quota check. Either way the application stack deploys **automatically via cloud-init on first boot** — no SSH key, no manual steps — with a **service portal on port 80** giving you one clickable index of everything running.
 
-Pick one **workload**:
+The two clouds share `scripts/` verbatim. Only the infrastructure and three genuinely cloud-specific behaviours differ; see [Azure](#azure) for the from-zero setup and for what changes.
+
+Pick one **workload** (AWS; on Azure only `minimax-h3` is wired up so far):
 
 | Workload | Hardware | What runs |
 |---|---|---|
@@ -116,13 +118,13 @@ A g5.xlarge costs ~$1.20/h, so forgetting it running overnight is a $20 mistake.
 |---|---|---|---|---|
 | **Hard TTL** | systemd timer, `OnBootSec` | **stop** | stop **4 h** after boot | `auto_stop_hours` workflow input (`0` disables) |
 | **Idle stop** | systemd timer, probed every 5 min | **stop** | stop after **30 min** with GPU < 5 % and no connections on the service ports | `idle_stop_minutes` Terraform var |
-| **Nightly** | EventBridge Scheduler → ASG `desired=0` | **terminate** | **01:00 Europe/Amsterdam** | `infra/aws/operations.tf` |
+| **Nightly** | AWS: EventBridge Scheduler → ASG `desired=0`<br>Azure: native auto-shutdown schedule | AWS: **terminate**<br>Azure: **deallocate** | **01:00 Europe/Amsterdam** | `infra/aws/operations.tf`<br>`infra/azure/operations.tf` |
 
-The first two layers call `systemctl poweroff`. The launch template pins `instance_initiated_shutdown_behavior = "stop"`, so an OS shutdown **stops** the instance rather than terminating it — the root volume and any cached models survive untouched, and no extra IAM permissions are needed.
+The first two layers call `stop_self()` from `scripts/lib_cloud.sh`, which is **not the same operation on both clouds**. On AWS it is `systemctl poweroff`: the launch template pins `instance_initiated_shutdown_behavior = "stop"`, so an OS shutdown **stops** the instance rather than terminating it — the root volume and any cached models survive untouched, and no extra IAM permissions are needed. On Azure a guest poweroff leaves the VM **allocated and fully billed**, so the same layer calls the ARM *deallocate* API with the VM's own managed identity. See [Azure](#azure).
 
 **That only works because the ASG has `HealthCheck` and `ReplaceUnhealthy` suspended.** A default Auto Scaling group fails a stopped member's EC2 health check, terminates it, and launches a replacement — which would turn the cheapest cost guardrail into a $13/h billing loop. `AZRebalance` is suspended for a related reason: with subnets in several zones the group would otherwise be free to terminate a healthy instance just to even out the distribution of a one-instance group. If you ever un-suspend those processes, the two in-VM layers must be rewritten to call `aws autoscaling set-desired-capacity --desired-capacity 0` instead of `poweroff`.
 
-The **nightly layer is different in kind: it terminates.** That is not a preference — EventBridge can only call `StopInstances` with an explicit instance ID, and under an ASG there is no instance ID at plan time. `SetDesiredCapacity` works on the group name, which Terraform does know. The trade is a model re-download the next morning (~30–45 min of instance time for H3) instead of ~$210 of runtime.
+The **nightly layer is different in kind: on AWS it terminates.** That is not a preference — EventBridge can only call `StopInstances` with an explicit instance ID, and under an ASG there is no instance ID at plan time. `SetDesiredCapacity` works on the group name, which Terraform does know. The trade is a model re-download the next morning (~30–45 min of instance time for H3) instead of ~$210 of runtime. Azure has no such constraint — a plain VM has a known id — so its nightly layer deallocates and the checkpoint survives.
 
 The idle probe deliberately treats these as *busy*, so it never stops a machine that is still working:
 
@@ -140,15 +142,18 @@ sudo nano /etc/llm-lab/autostop.env    # retune without redeploying
 
 ### "Autostop" is not "no-cost"
 
-The first two layers **stop** the instance; only the nightly one destroys it. While stopped you still pay for EBS (a 500 GiB gp3 root volume for H3 is ~$50/month on its own) and the Elastic IP. Run `destroy` when you want zero ongoing charges — but note that destroying an H3 deployment throws away the 144 GB checkpoint, which then has to be re-downloaded next time.
+The first two layers **stop** the instance; only the AWS nightly one destroys it. While stopped you still pay for storage (a 500 GiB gp3 root volume for H3 is ~$50/month on its own) and the Elastic IP; the same applies to a deallocated Azure VM's OS disk and static public IP. Run `destroy` when you want zero ongoing charges — but note that destroying an H3 deployment throws away the 144 GB checkpoint, which then has to be re-downloaded next time.
 
 Restarting after a TTL/idle stop keeps the checkpoint:
 
 ```bash
-ASG=$(terraform -chdir=infra output -raw asg_name)
+ASG=$(terraform -chdir=infra/aws output -raw asg_name)
 ID=$(aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names "$ASG" \
        --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text)
 aws ec2 start-instances --instance-ids "$ID"
+
+# Azure
+az vm start -g llm-gpu-lab -n llm-gpu
 ```
 
 Scaling the group to zero does not — it terminates:
@@ -161,7 +166,7 @@ The durable fix is a snapshot-backed `/opt/models` volume so the weights outlive
 
 ---
 
-## Supported regions
+## Supported regions (AWS)
 
 | Region | Location | Notes |
 |---|---|---|
@@ -179,7 +184,7 @@ An Auto Scaling group is a **regional** resource: it waterfalls across instance 
 
 ---
 
-## Supported instance types
+## Supported instance types (AWS)
 
 ### Single GPU — 1× NVIDIA A10G, 24 GB GPU RAM
 
@@ -215,7 +220,7 @@ The two shapes need different parallelism flags (4 GPUs wants `--ulysses-degree 
 ## Repository layout
 
 ```
-infra/
+infra/aws/
   network.tf        VPC, one subnet per capable AZ, internet gateway, routing
   compute.tf        Security group, launch template, capacity-hunting ASG, Elastic IP
   provisioning.tf   S3 scripts bucket, IAM role/instance profile
@@ -224,10 +229,21 @@ infra/
   locals.tf         Instance-type waterfall, computed values, shared tags
   outputs.tf        ASG name, public IP, portal + app URLs, lifecycle commands
 
-scripts/
-  user-data.sh                  Cloud-init entry point (claims the EIP, downloads scripts from S3)
+infra/azure/
+  network.tf        Resource group, VNet, subnet, NSG, static public IP, NIC
+  compute.tf        Linux VM + NVIDIA driver extension, H3 preconditions
+  provisioning.tf   Storage account for scripts, the VM's two role assignments
+  operations.tf     Nightly auto-shutdown schedule (deallocates, keeps the disk)
+  variables.tf      All tunable inputs
+  locals.tf         H3-capable sizes, NSG port map, shared tags
+  outputs.tf        Public IP, endpoints, start/log commands
+
+scripts/                        (shared by both clouds)
+  user-data.sh                  AWS cloud-init entry point (claims the EIP, downloads scripts from S3)
+  user-data-azure.sh            Azure cloud-init entry point (waits for the GPU driver, downloads from Blob Storage)
   bootstrap_all.sh              Orchestrator: gates every stack on an ENABLE_* flag
   lib_docker_gpu.sh             Shared Docker + NVIDIA Container Toolkit setup (sourced, no side effects)
+  lib_cloud.sh                  Cloud detection, stop-self, ephemeral-disk discovery (sourced, no side effects)
   provision_monitoring_stack.sh Netdata agent + real-time GPU/CPU/RAM/disk dashboard (port 19999)
   provision_llm_stack.sh        Ollama + Open WebUI via docker compose
   provision_tts_stack.sh        Python venv + Kokoro + XTTS-v2 + Piper + Gradio app
@@ -240,12 +256,13 @@ scripts/
   provision_landing_stack.sh    nginx + service portal listing the stacks that were installed (port 80)
 
 .github/workflows/
-  manage-llm-vm.yml       Manual workflow: apply / destroy
+  manage-llm-vm.yml         Manual workflow: apply / destroy on AWS
+  manage-llm-vm-azure.yml   Manual workflow: apply / destroy on Azure
 ```
 
 ---
 
-## Prerequisites
+## Prerequisites — AWS
 
 1. **AWS credentials** with permissions for EC2, VPC, Auto Scaling, IAM, S3, EventBridge Scheduler.
 2. **S3 bucket** for Terraform remote state (one per AWS account is enough). State is keyed per deploy region (`llm-gpu/<region>/terraform.tfstate`) so each region is independent and never collides. The bucket itself lives in a single region regardless of where you deploy the VM — set `TF_STATE_REGION` if it is not in `eu-central-1`.
@@ -254,7 +271,7 @@ scripts/
 
 ---
 
-## Quickstart — GitHub Actions
+## Quickstart — GitHub Actions (AWS)
 
 ### 1. Add repository secrets
 
@@ -290,15 +307,15 @@ Note that **apply does not wait for capacity**. If the group is still hunting wh
 
 ---
 
-## Quickstart — local Terraform
+## Quickstart — local Terraform (AWS)
 
 ```bash
-terraform -chdir=infra init \
+terraform -chdir=infra/aws init \
   -backend-config="bucket=<your-tfstate-bucket>" \
   -backend-config="key=llm-gpu/eu-west-1/terraform.tfstate" \
   -backend-config="region=eu-central-1"
 
-terraform -chdir=infra apply -auto-approve \
+terraform -chdir=infra/aws apply -auto-approve \
   -var='aws_region=eu-west-1' \
   -var='instance_type=g5.xlarge' \
   -var='ipv4_allowed=203.0.113.25'
@@ -307,7 +324,7 @@ terraform -chdir=infra apply -auto-approve \
 For the video workload, every other stack has to be off and the volume has to be big and fast:
 
 ```bash
-terraform -chdir=infra apply -auto-approve \
+terraform -chdir=infra/aws apply -auto-approve \
   -var='aws_region=eu-central-1' \
   -var='instance_type=g6e.12xlarge' \
   -var='ipv4_allowed=203.0.113.25' \
@@ -322,10 +339,287 @@ Get any of that wrong and Terraform fails during `plan` with an explanation, rat
 `apply` returns as soon as the Auto Scaling group exists — it does not block waiting for a GPU. Watch the hunt with:
 
 ```bash
-eval "$(terraform -chdir=infra output -raw capacity_hunt_command)"
+eval "$(terraform -chdir=infra/aws output -raw capacity_hunt_command)"
 ```
 
 `Successful` means a GPU was found; repeated `Failed` rows with `InsufficientInstanceCapacity` mean every pool in the waterfall is currently empty and the group is still retrying. Nothing needs re-applying either way.
+
+---
+
+## Azure
+
+Same scripts, same stacks, same guardrails. Everything under `scripts/` is shared verbatim — Ubuntu, Docker, the NVIDIA container toolkit and systemd behave identically on both clouds. What changes is the infrastructure underneath and exactly three behaviours, all three of which cost money or time when they are got wrong.
+
+Only the `minimax-h3` workload is wired up on Azure so far.
+
+### What actually differs
+
+| | AWS | Azure |
+|---|---|---|
+| **Stopping the VM from inside** | `poweroff` → EC2 stop → billing ends | `poweroff` leaves the VM **allocated and fully billed**. Only an ARM *deallocate* stops the meter |
+| **Capacity** | ASG hunts across instance types and AZs | No equivalent for a single VM. A preflight step checks SKU + quota before anything is created |
+| **GPU driver** | Deep Learning AMI ships it | Plain Ubuntu does not. A VM extension installs it **concurrently with cloud-init**, so the bootstrap has to wait for it |
+| Public address | Elastic IP, claimed by the instance on boot | Static public IP, bound to the NIC at plan time — no in-VM claim |
+| Scripts delivery | S3 + IAM instance profile | Blob Storage + system-assigned managed identity |
+| Fast disk | gp3, throughput set independently of size | Premium SSD v2 cannot back an OS disk, so throughput comes from the capacity tier |
+| Nightly backstop | ASG `desired=0` → **terminates**, model cache lost | Native auto-shutdown → **deallocates**, model cache survives |
+
+The first row is the one that matters. `stop_self()` in `scripts/lib_cloud.sh` deliberately **does not** fall back to `poweroff` on Azure if it cannot get a managed-identity token: it logs and leaves the VM running. A silent fallback would produce a guardrail that reports success and saves nothing, which is worse than no guardrail at all.
+
+The last row is the one place Azure is straightforwardly better: an overnight forget costs a morning restart, not a 144 GB re-download.
+
+### Supported VM sizes
+
+| Size | GPUs | vCPU / RAM | Notes |
+|---|---|---|---|
+| `Standard_NC80adis_H100_v5` | 2× H100 NVL 94 GB | 80 / 640 GiB | **Default.** The SGLang cookbook publishes a verified H100 TP2 recipe |
+| `Standard_NC288lds_xl_RTXPRO6000BSE_v6` | 2× RTX PRO 6000 96 GB | 288 / 516 GiB | Same silicon as the AWS `g7e.12xlarge` |
+| `Standard_NC288ds_xl_RTXPRO6000BSE_v6` | 2× RTX PRO 6000 96 GB | 288 / 1032 GiB | As above with double the host RAM |
+
+H100 NVL is the default rather than the RTX PRO 6000 the AWS side uses, for two reasons. There is a published, measured H100 recipe and no RTX PRO 6000 profile at all, so this path starts from numbers instead of rediscovering them on the meter. And Azure only sells the second RTX PRO 6000 attached to 288 vCPUs — `NC144ds_xl` stops at one GPU — which is a lot of CPU this workload never touches.
+
+Single-GPU sizes are rejected in `plan` even at 94–96 GB: the TP2 shard is what keeps the DiT resident, and one card puts it back on layerwise offload.
+
+### Setup from zero
+
+Everything below is one-time, per subscription. Copy the block, don't retype it.
+
+#### 1. Tools and login
+
+You need the [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli), Terraform ≥ 1.6, and **Owner** on the target subscription — or **Contributor** plus **Role Based Access Control Administrator**. Plain Contributor is not enough: the deployment grants the VM two roles of its own, and assigning a role is a separate permission from creating resources.
+
+```bash
+az login
+az account set --subscription "<subscription name or id>"
+
+export SUB_ID=$(az account show --query id -o tsv)
+export TENANT_ID=$(az account show --query tenantId -o tsv)
+export LOC=westeurope
+```
+
+#### 2. Register resource providers
+
+A fresh subscription has most of these unregistered, and the failure surfaces mid-apply.
+
+```bash
+for ns in Microsoft.Compute Microsoft.Network Microsoft.Storage Microsoft.DevTestLab; do
+  az provider register --namespace "$ns" --wait
+done
+```
+
+`Microsoft.DevTestLab` is the surprising one. The nightly auto-shutdown is a `Microsoft.DevTestLab/schedules` resource even though no DevTest Lab exists — that provider is simply where Azure put VM shutdown schedules.
+
+#### 3. GPU quota — do this first, it has the longest lead time
+
+GPU quota is **per family, per region, and starts at 0**. This is the single most common reason a first Azure GPU deploy fails.
+
+```bash
+# Is the SKU even offered here, and is it restricted?
+az vm list-skus -l "$LOC" --size Standard_NC80adis_H100_v5 \
+  --resource-type virtualMachines --all -o table
+
+# How many vCPUs of that family are you allowed?
+az vm list-usage -l "$LOC" -o table | grep -i "H100"
+```
+
+If the limit is `0`, request an increase before going further: **Portal → Subscriptions → your subscription → Usage + quotas → filter on `Standard NCADS_H100_v5 Family vCPUs` → New quota request**. Ask for at least **80** vCPUs (the size is 80; 160 gives you room to redeploy while the old VM is still deallocating).
+
+Pay-as-you-go subscriptions are often refused large GPU quota on the first attempt. If that happens, open a support case explaining the workload rather than re-submitting the same request.
+
+#### 4. Terraform state storage
+
+Terraform cannot create the account it stores its own state in, so this is manual — exactly like the S3 bucket on the AWS side.
+
+```bash
+export STATE_RG=llm-lab-tfstate
+export STATE_SA="llmlabtfstate$(openssl rand -hex 4)"   # 3-24 chars, lowercase alnum, globally unique
+export STATE_CONTAINER=tfstate
+
+az group create -n "$STATE_RG" -l "$LOC"
+
+az storage account create \
+  -n "$STATE_SA" -g "$STATE_RG" -l "$LOC" \
+  --sku Standard_LRS --kind StorageV2 \
+  --min-tls-version TLS1_2 \
+  --allow-blob-public-access false \
+  --allow-shared-key-access false
+
+# State is the one thing you cannot rebuild. Versioning is the cheapest possible
+# insurance against a corrupted or truncated write.
+az storage account blob-service-properties update \
+  --account-name "$STATE_SA" -g "$STATE_RG" --enable-versioning true
+```
+
+Shared keys are disabled, so every caller — you included — authenticates as a principal. Grant yourself data access **before** creating the container, and give the assignment a minute to propagate:
+
+```bash
+export MY_OID=$(az ad signed-in-user show --query id -o tsv)
+
+az role assignment create \
+  --assignee-object-id "$MY_OID" --assignee-principal-type User \
+  --role "Storage Blob Data Contributor" \
+  --scope "/subscriptions/$SUB_ID/resourceGroups/$STATE_RG/providers/Microsoft.Storage/storageAccounts/$STATE_SA"
+
+sleep 60   # RBAC is eventually consistent; the next command fails without this
+
+az storage container create \
+  --name "$STATE_CONTAINER" --account-name "$STATE_SA" --auth-mode login
+```
+
+#### 5. App registration and federated credential (OIDC)
+
+No client secret is created anywhere in this setup. GitHub presents a short-lived signed token and Entra ID trades it for an access token.
+
+```bash
+export GH_ORG=<your-github-org-or-user>
+export GH_REPO=<your-repo-name>
+
+export APP_ID=$(az ad app create --display-name "github-llm-gpu-lab" --query appId -o tsv)
+az ad sp create --id "$APP_ID"
+export SP_OID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
+
+az ad app federated-credential create --id "$APP_ID" --parameters "{
+  \"name\": \"github-main\",
+  \"issuer\": \"https://token.actions.githubusercontent.com\",
+  \"subject\": \"repo:${GH_ORG}/${GH_REPO}:ref:refs/heads/main\",
+  \"audiences\": [\"api://AzureADTokenExchange\"]
+}"
+```
+
+The `subject` must match the ref the workflow runs from, **exactly**. Running it from any other branch fails with `AADSTS70021: No matching federated identity record found` — which reads like a broken credential but only means the branch is different. Add one credential per branch you deploy from, or switch to `repo:ORG/REPO:environment:<name>` and declare that `environment:` in the job.
+
+#### 6. Role assignments for the service principal
+
+```bash
+# Create the lab. Subscription scope because Terraform creates the resource
+# group; narrow it to the RG if you pre-create and import that instead.
+az role assignment create \
+  --assignee-object-id "$SP_OID" --assignee-principal-type ServicePrincipal \
+  --role "Contributor" --scope "/subscriptions/$SUB_ID"
+
+# Grant the VM its own two roles. Without this the VM can neither fetch its
+# provisioning scripts nor deallocate itself, and the cost guardrails become
+# decoration. "User Access Administrator" also works and is wider.
+az role assignment create \
+  --assignee-object-id "$SP_OID" --assignee-principal-type ServicePrincipal \
+  --role "Role Based Access Control Administrator" --scope "/subscriptions/$SUB_ID"
+
+# Read and write the Terraform state.
+az role assignment create \
+  --assignee-object-id "$SP_OID" --assignee-principal-type ServicePrincipal \
+  --role "Storage Blob Data Contributor" \
+  --scope "/subscriptions/$SUB_ID/resourceGroups/$STATE_RG/providers/Microsoft.Storage/storageAccounts/$STATE_SA"
+```
+
+#### 7. GitHub repository secrets
+
+```bash
+echo "AZURE_CLIENT_ID           $APP_ID"
+echo "AZURE_TENANT_ID           $TENANT_ID"
+echo "AZURE_SUBSCRIPTION_ID     $SUB_ID"
+echo "TF_STATE_RESOURCE_GROUP   $STATE_RG"
+echo "TF_STATE_STORAGE_ACCOUNT  $STATE_SA"
+echo "TF_STATE_CONTAINER        $STATE_CONTAINER"
+```
+
+| Secret | Purpose |
+|---|---|
+| `AZURE_CLIENT_ID` | Application (client) ID of the app registration |
+| `AZURE_TENANT_ID` | Entra ID tenant |
+| `AZURE_SUBSCRIPTION_ID` | Target subscription |
+| `TF_STATE_RESOURCE_GROUP` | Resource group holding the state account |
+| `TF_STATE_STORAGE_ACCOUNT` | State storage account name |
+| `TF_STATE_CONTAINER` | State container name |
+
+None of these is a credential. The client ID and tenant ID are identifiers, not secrets; they live in secrets only to keep them out of logs.
+
+### Run the workflow
+
+**Actions → Manage GPU VM (Azure) → Run workflow**:
+
+| Input | Description | Default |
+|---|---|---|
+| `action` | `apply` to create, `destroy` to tear down | `apply` |
+| `vm_size` | See the size table above | `Standard_NC80adis_H100_v5` |
+| `location` | Target region | `westeurope` |
+| `ipv4_allowed` | Your public IPv4 (e.g. `203.0.113.25`) | *(required)* |
+| `ssh_public_key` | OpenSSH public key. Blank = no SSH login at all | *(blank)* |
+| `os_disk_size` | `1024` (P30, 200 MB/s) or `512` (P20, 150 MB/s) | `1024` |
+| `auto_stop_hours` | Hard TTL from boot; `0` disables it | `4` |
+
+The job runs a **preflight** before creating anything: it prints a table of every H3-capable size in that region with its restrictions, then fails with an explicit message if the chosen size is unavailable or its family quota is 0. That is the Azure equivalent of the AWS Terraform preconditions — SKU availability and quota are account state, not configuration, so they need a live API call rather than a `precondition` block.
+
+First boot installs the GPU driver, then downloads the ~144 GB Ref2VA checkpoint. Budget 30–45 minutes before the REST API answers.
+
+### Local Terraform
+
+```bash
+terraform -chdir=infra/azure init \
+  -backend-config="resource_group_name=$STATE_RG" \
+  -backend-config="storage_account_name=$STATE_SA" \
+  -backend-config="container_name=$STATE_CONTAINER" \
+  -backend-config="key=llm-gpu/azure/westeurope/terraform.tfstate"
+
+terraform -chdir=infra/azure apply -auto-approve \
+  -var='location=westeurope' \
+  -var='vm_size=Standard_NC80adis_H100_v5' \
+  -var='ipv4_allowed=203.0.113.25' \
+  -var="ssh_public_key=$(cat ~/.ssh/id_ed25519.pub)"
+```
+
+Running locally with `az login`, drop `use_oidc` from your environment — the provider picks up the CLI credentials on its own.
+
+To stop paying without destroying anything (the Azure equivalent of `desired_capacity = 0`):
+
+```bash
+terraform -chdir=infra/azure apply -auto-approve -var='vm_enabled=false'
+```
+
+That destroys the VM and its disk but keeps the VNet, NSG, public IP, storage account and identity, so the next apply is quick.
+
+### Verifying and watching it
+
+```bash
+RG=llm-gpu-lab
+
+# Where the first boot has got to, without SSH
+az vm run-command invoke -g $RG -n llm-gpu --command-id RunShellScript \
+  --scripts 'tail -100 /var/log/llm-lab-bootstrap.log'
+
+# Did the driver extension succeed?
+az vm extension list -g $RG --vm-name llm-gpu -o table
+
+# Is it allocated or deallocated? "VM deallocated" means you are not paying.
+az vm get-instance-view -g $RG -n llm-gpu \
+  --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" -o tsv
+
+# Bring it back after an autostop
+az vm start -g $RG -n llm-gpu
+```
+
+### When it goes wrong
+
+| Symptom | Cause |
+|---|---|
+| `AADSTS70021: No matching federated identity record` | The branch you ran from does not match the federated credential's `subject`. Add a credential for that branch |
+| `AuthorizationFailed` on `Microsoft.Authorization/roleAssignments/write` | The service principal has Contributor but not RBAC Administrator. Step 6 |
+| `SkuNotAvailable` / `NotAvailableForSubscription` | The size exists in the region but not for your subscription. Try another region; the preflight table shows all three candidates at once |
+| `QuotaExceeded` despite an approved request | Quota is per family *and* region. Check the region you are actually deploying to |
+| Apply succeeds, H3 never starts | Read the bootstrap log. If it stops at `FATAL: no working NVIDIA driver`, the extension failed — `az vm extension list` |
+| `403` fetching provisioning scripts | The `Storage Blob Data Reader` assignment is still propagating. It is eventually consistent; the VM retries on the next boot |
+| VM shows `VM running` after an idle stop | The managed identity could not deallocate. Check `journalctl -t llm-lab-idle` — this is the failure mode `stop_self()` refuses to hide |
+| Terraform state errors mentioning `AuthorizationPermissionMismatch` | Missing `Storage Blob Data Contributor` on the state account, or shared keys disabled without `use_azuread_auth` |
+
+### Tearing it all down
+
+```bash
+# The lab
+terraform -chdir=infra/azure destroy -auto-approve
+
+# The one-time scaffolding, if you are done with Azure entirely
+az group delete -n "$STATE_RG" --yes
+az ad app delete --id "$APP_ID"
+```
 
 ---
 

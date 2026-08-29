@@ -13,11 +13,16 @@ terraform {
   }
 
   # Backend values come from the workflow (-backend-config), same pattern as the
-  # AWS stack. use_oidc lets the federated GitHub token reach the state
-  # container too: without it Terraform authenticates the provider with OIDC and
-  # then fails on the very first state read.
+  # AWS stack.
+  #
+  # use_oidc lets the federated GitHub token reach the state container too:
+  # without it Terraform authenticates the provider with OIDC and then fails on
+  # the very first state read. use_azuread_auth makes the backend talk to blob
+  # storage as the principal rather than fetching the account's shared key over
+  # ARM -- which is what lets the state account keep shared keys disabled.
   backend "azurerm" {
-    use_oidc = true
+    use_oidc         = true
+    use_azuread_auth = true
   }
 }
 
